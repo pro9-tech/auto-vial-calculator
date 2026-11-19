@@ -1,0 +1,19 @@
+/* ═══ 이 두 줄이 디자인 시스템 전부입니다 (웹폰트 포함) ═══
+   ⚠️ @import 는 반드시 파일 최상단이어야 합니다.
+   /v5/ = 버전 고정. 최신을 따라가려면 /v5/ 를 빼면 됩니다. */
+@import url("https://ds.janytree.app/v5/jt-tokens.css");
+@import url("https://ds.janytree.app/v5/jt-utilities.css");
+
+body {
+  margin: 0;
+  font-family: var(--font-base);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  color: var(--color-text);
+  background: var(--color-bg-layout);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ⚠️ word-break:keep-all 을 여기 넣지 마세요 — 토큰 파일이 :lang(ko) 한정으로 처리합니다.
+   전역에 걸면 중국어·일본어·태국어에서 레이아웃이 붕괴합니다. */
+
