@@ -209,303 +209,315 @@ function resolveNestedCircles(rawCircles) {
   })
 }
 
-// 밀집 바이알 트레이 특화: 적분 이미지 기반 중앙 어두운 코어 + 밝은 주변 링(Core-Ring DoG) 피크 검출
+// 밀집 바이알 트레이 특화: HSV 초록색 트레이 배경 제거 + 캡 중앙 어두운 원형 점(블롭) + 원근 왜곡 보정
 function detectDenseVialCores(imageData, minR, maxR, sensitivity) {
   const { width: w, height: h, data } = imageData
-  if (!w || !h || !data) return []
+  if (!w || !h || !data || w < 100 || h < 100) return []
 
   const n = w * h
   const gray = new Float32Array(n)
+  const isGreenTray = new Uint8Array(n)
+
+  let trayMinX = w
+  let trayMaxX = 0
+  let trayMinY = h
+  let trayMaxY = 0
+  let trayGreenCount = 0
+
+  // 1단계: HSV 색상 필터로 초록색 트레이 배경 판별 및 ROI 바운딩 박스 추출
   for (let i = 0; i < n; i += 1) {
     const p = i * 4
-    gray[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]
-  }
+    const r = data[p]
+    const g = data[p + 1]
+    const b = data[p + 2]
+    gray[i] = 0.299 * r + 0.587 * g + 0.114 * b
 
-  const iw = w + 1
-  const integral = new Float64Array(iw * (h + 1))
-  for (let y = 0; y < h; y += 1) {
-    let rowSum = 0
-    const gRow = y * w
-    const iPrev = y * iw
-    const iCurr = (y + 1) * iw
-    for (let x = 0; x < w; x += 1) {
-      rowSum += gray[gRow + x]
-      integral[iCurr + x + 1] = integral[iPrev + x + 1] + rowSum
+    const max = Math.max(r, g, b)
+    const min = Math.min(r, g, b)
+    const diff = max - min
+    if (diff > 0 && max > 40) {
+      let hue = 0
+      if (max === r) hue = ((g - b) / diff + (g < b ? 6 : 0)) * 60
+      else if (max === g) hue = ((b - r) / diff + 2) * 60
+      else hue = ((r - g) / diff + 4) * 60
+
+      const sat = diff / max
+      // 초록색 트레이 고유 HSV 대역 (H: 70..170, S >= 0.25)
+      if (hue >= 70 && hue <= 170 && sat >= 0.25) {
+        isGreenTray[i] = 1
+        const x = i % w
+        const y = (i / w) | 0
+        if (x < trayMinX) trayMinX = x
+        if (x > trayMaxX) trayMaxX = x
+        if (y < trayMinY) trayMinY = y
+        if (y > trayMaxY) trayMaxY = y
+        trayGreenCount += 1
+      }
     }
   }
 
-  const boxMean = (cx, cy, r) => {
-    const x1 = Math.max(0, Math.floor(cx - r))
-    const y1 = Math.max(0, Math.floor(cy - r))
-    const x2 = Math.min(w - 1, Math.ceil(cx + r))
-    const y2 = Math.min(h - 1, Math.ceil(cy + r))
-    const area = (x2 - x1 + 1) * (y2 - y1 + 1)
-    if (area <= 0) return 0
-    return (
-      (integral[(y2 + 1) * iw + (x2 + 1)] -
-        integral[y1 * iw + (x2 + 1)] -
-        integral[(y2 + 1) * iw + x1] +
-        integral[y1 * iw + x1]) /
-      area
-    )
-  }
+  // 트레이가 확인되면 트레이 내부의 바이알 군집 영역으로 탐색 범위를 엄격히 한정 (발바닥 덧신, 트레이 바깥 금속 레일 노이즈 100% 차단)
+  const hasTray = trayGreenCount > n * 0.08
+  let startX = 20
+  let endX = w - 20
+  let startY = 20
+  let endY = h - 20
 
-  const estR = Math.max(10, Math.round((minR + maxR) * 0.53))
-  const rCore = Math.max(3, Math.round(estR * 0.18))
-  const rRing = Math.max(rCore + 4, Math.round(estR * 0.72))
-  const rOuter = Math.round(estR * 1.1)
-  if (w <= rOuter * 2 + 4 || h <= rOuter * 2 + 4) return []
-
-  const areaCore = (2 * rCore + 1) ** 2
-  const areaMid = (2 * rRing + 1) ** 2
-  const contrastThresh = Math.max(12, 40 - (sensitivity / 100) * 28)
-  const sampleDist = Math.round(estR * 0.56)
-
-  // 10x10 타일 블록당 최고 점수 1개만 추출해 NMS 연산을 100배 가속 (슬라이더 렉 방지)
-  const tileSize = 10
-  const tilesX = Math.ceil(w / tileSize)
-  const tilesY = Math.ceil(h / tileSize)
-  const tileBest = new Array(tilesX * tilesY).fill(null)
-
-  for (let y = rOuter; y < h - rOuter; y += 3) {
-    const ty = (y / tileSize) | 0
-    for (let x = rOuter; x < w - rOuter; x += 3) {
-      const core = boxMean(x, y, rCore)
-      if (core > 145) continue
-
-      const mid = boxMean(x, y, rRing)
-      const ring = (mid * areaMid - core * areaCore) / Math.max(1, areaMid - areaCore)
-      const diff = ring - core
-      if (diff < contrastThresh || ring < 108) continue
-
-      // 8방향 링 대칭성 + 외곽 원형 윤곽선 경계(안쪽 0.78R vs 바깥쪽 1.08R) 동시 검증
-      let brightDirs = 0
-      let edgeHits = 0
-      let quadMask = 0
-
-      for (let k = 0; k < ANGLE_SAMPLES; k += 3) {
-        const cosK = COS_TABLE[k]
-        const sinK = SIN_TABLE[k]
-
-        const ix = Math.round(x + sampleDist * cosK)
-        const iy = Math.round(y + sampleDist * sinK)
-        const iv = gray[iy * w + ix]
-        if (iv > core + diff * 0.4 && iv > 105) {
-          brightDirs += 1
-        }
-
-        const rxIn = Math.round(x + estR * 0.78 * cosK)
-        const ryIn = Math.round(y + estR * 0.78 * sinK)
-        const rxOut = Math.round(x + estR * 1.08 * cosK)
-        const ryOut = Math.round(y + estR * 1.08 * sinK)
-        if (gray[ryIn * w + rxIn] - gray[ryOut * w + rxOut] > 12) {
-          edgeHits += 1
-          quadMask |= 1 << ((k / 6) | 0)
+  if (hasTray) {
+    // 트레이 내부에서 비-초록 알루미늄 바이알 캡이 집중된 세로 구역을 자동으로 찾습니다.
+    let maxVialY = trayMinY
+    for (let y = trayMinY + 30; y < trayMaxY - 30; y += 1) {
+      let nonGreenCount = 0
+      const row = y * w
+      for (let x = 80; x < w - 80; x += 1) {
+        if (!isGreenTray[row + x] && gray[row + x] >= 90 && gray[row + x] <= 230) {
+          nonGreenCount += 1
         }
       }
+      if (nonGreenCount > 80) maxVialY = y
+    }
+    startY = Math.max(16, trayMinY + 120) // 상단 트레이 테두리 레일 노이즈 원천 배제
+    endY = Math.min(trayMaxY, maxVialY + 45) // 바이알 군집 바로 아래까지(바닥 덧신 원천 차단)
+    startX = 100 // 트레이 좌측 벽 바깥 노이즈 배제
+    endX = w - 100 // 트레이 우측 금속 레일 노이즈 배제
+  }
 
-      if (brightDirs >= 6 && edgeHits >= 4 && countBits4(quadMask) >= 3) {
-        const rawScore = diff * (brightDirs / 8) * (0.6 + 0.4 * (edgeHits / 8))
-        const tx = (x / tileSize) | 0
-        const tid = ty * tilesX + tx
-        if (!tileBest[tid] || rawScore > tileBest[tid].rawScore) {
-          tileBest[tid] = {
-            x,
-            y,
-            r: estR,
-            rawScore,
-            confidence: Math.min(1, 0.75 + Math.min(0.24, rawScore / 180)),
-            score: 1.15 + Math.min(0.5, rawScore / 160),
+  const estR = Math.max(10, Math.round((minR + maxR) * 0.52))
+  const sampleR = Math.max(14, Math.round(estR * 0.56))
+  const minDiff = Math.max(26, 60 - (sensitivity / 100) * 27)
+  const minRingLuma = Math.max(85, 116 - (sensitivity / 100) * 20)
+  const maxCoreLuma = Math.min(105, 80 + (sensitivity / 100) * 27)
+
+  // 2단계: 캡 정중앙의 어두운 원형 점(블롭) 국소 최솟값 및 둘레 알루미늄 링 대비 탐색
+  const rawBlobs = []
+  const DIRS = 12
+
+  for (let y = startY; y < endY; y += 1) {
+    const row = y * w
+    for (let x = startX; x < endX; x += 1) {
+      const idx = row + x
+      // 초록색 트레이 배경 자체는 바이알 중심이 될 수 없음
+      if (hasTray && isGreenTray[idx]) continue
+
+      const centerVal = gray[idx]
+      if (centerVal > maxCoreLuma) continue
+
+      // 3x3 국소 최솟값 검증
+      let isLocalMin = true
+      for (let dy = -1; dy <= 1 && isLocalMin; dy += 1) {
+        const nRow = (y + dy) * w
+        for (let dx = -1; dx <= 1; dx += 1) {
+          if (dx === 0 && dy === 0) continue
+          if (gray[nRow + x + dx] < centerVal) {
+            isLocalMin = false
+            break
           }
         }
       }
+      if (!isLocalMin) continue
+
+      // 둘레 링(알루미늄 캡) 밝기 측정
+      let ringSum = 0
+      for (let k = 0; k < DIRS; k += 1) {
+        const rad = (k * Math.PI * 2) / DIRS
+        const rx = Math.round(x + sampleR * Math.cos(rad))
+        const ry = Math.round(y + sampleR * Math.sin(rad))
+        ringSum += gray[ry * w + rx]
+      }
+      const ringMean = ringSum / DIRS
+      const diff = ringMean - centerVal
+
+      if (diff >= minDiff && ringMean >= minRingLuma) {
+        rawBlobs.push({
+          x,
+          y,
+          r: estR,
+          score: diff,
+          confidence: Math.min(1, 0.78 + Math.min(0.21, diff / 140)),
+        })
+      }
     }
   }
 
-  return tileBest.filter(Boolean)
+  // 3단계: 원근 왜곡(Perspective Pitch) 보정 및 중복 제거
+  // 위쪽 바이알은 거리가 멀어 중심 간격이 좁고(48.7px), 아래쪽 바이알은 가까워 간격이 넓어지는(53.7px) 현상을 동적 스케일링
+  rawBlobs.sort((a, b) => b.score - a.score)
+  const accepted = []
+
+  for (let i = 0; i < rawBlobs.length; i += 1) {
+    const b = rawBlobs[i]
+    const yRatio = clamp((b.y - startY) / Math.max(1, endY - startY), 0, 1)
+    const dynamicMinDist = (48.7 + yRatio * 5.0) * (estR / 33)
+
+    let overlaps = false
+    for (let j = 0; j < accepted.length; j += 1) {
+      const a = accepted[j]
+      if (Math.hypot(b.x - a.x, b.y - a.y) < dynamicMinDist) {
+        overlaps = true
+        break
+      }
+    }
+    if (!overlaps) {
+      accepted.push(b)
+    }
+  }
+
+  return accepted
 }
 
-// 카트 적재 박스 특화: 수직 열 분리 + V자 수평 틈새 골짜기 분할 검출기
+// 카트 적재 프라단 박스 특화: HSV 초록색 박스 추출 + 좌우 2열 분리 + 세로 그림자 골짜기 + 1단 표준 높이 비율 보정
 function detectStackedCartBoxes(imageData, sensitivity = 55) {
   const { width: w, height: h, data } = imageData
   if (!w || !h || !data || w < 120 || h < 120) return []
 
-  const rowChroma = new Float32Array(h)
-  const colChromaCount = new Float32Array(w)
-  const luma = new Float32Array(w * h)
+  const n = w * h
+  const isGreenBox = new Uint8Array(n)
+  const luma = new Float32Array(n)
 
-  for (let y = 0; y < h; y += 1) {
-    let cSum = 0
-    for (let x = 0; x < w; x += 1) {
-      const p = (y * w + x) * 4
-      const r = data[p]
-      const g = data[p + 1]
-      const b = data[p + 2]
-      const ch = Math.max(r, g, b) - Math.min(r, g, b)
-      cSum += ch
-      if (ch > 30) colChromaCount[x] += 1
-      luma[y * w + x] = 0.299 * r + 0.587 * g + 0.114 * b
+  // 1단계: HSV 색상 필터로 프라단 박스의 선명한 초록색 영역만 정확히 추출 (회색 바닥 반사광 제외)
+  for (let i = 0; i < n; i += 1) {
+    const p = i * 4
+    const r = data[p]
+    const g = data[p + 1]
+    const b = data[p + 2]
+    luma[i] = 0.299 * r + 0.587 * g + 0.114 * b
+
+    const max = Math.max(r, g, b)
+    const min = Math.min(r, g, b)
+    const diff = max - min
+    if (diff > 0 && max > 45) {
+      let hue = 0
+      if (max === r) hue = ((g - b) / diff + (g < b ? 6 : 0)) * 60
+      else if (max === g) hue = ((b - r) / diff + 2) * 60
+      else hue = ((r - g) / diff + 4) * 60
+
+      const sat = diff / max
+      // 초록색 프라단 박스 대역: H 75..170, S >= 0.26
+      if (hue >= 75 && hue <= 170 && sat >= 0.26) {
+        isGreenBox[i] = 1
+      }
     }
-    rowChroma[y] = cSum / w
+  }
+
+  // 행별/열별 초록색 박스 픽셀 수 기반 전체 박스 ROI 추출
+  const rowGreen = new Int32Array(h)
+  const colGreen = new Int32Array(w)
+  for (let y = 0; y < h; y += 1) {
+    const row = y * w
+    for (let x = 0; x < w; x += 1) {
+      if (isGreenBox[row + x]) {
+        rowGreen[y] += 1
+        colGreen[x] += 1
+      }
+    }
   }
 
   let topY = -1
   let botY = -1
   for (let y = 0; y < h; y += 1) {
-    if (rowChroma[y] > 24) {
+    if (rowGreen[y] > w * 0.15) {
       if (topY === -1) topY = y
       botY = y
     }
   }
 
   const roiH = botY - topY + 1
-  if (topY === -1 || roiH < 60) return []
+  if (topY === -1 || roiH < 50) return []
 
-  // 바닥 반사광 등을 배제하기 위해 ROI 높이의 28% 이상 유채색을 띠는 x범위만 전경으로 채택
   let leftX = -1
   let rightX = -1
   for (let x = 0; x < w; x += 1) {
-    if (colChromaCount[x] >= roiH * 0.28) {
+    if (colGreen[x] > roiH * 0.24) {
       if (leftX === -1) leftX = x
       rightX = x
     }
   }
 
-  if (leftX === -1 || rightX - leftX < 80) {
-    return []
-  }
+  if (leftX === -1 || rightX - leftX < 80) return []
 
-  // 앞면 적재부(42% ~ 92%)에서 수직 열 경계 틈새 탐색
-  const sampleY1 = Math.round(topY + roiH * 0.42)
-  const sampleY2 = Math.round(topY + roiH * 0.92)
-  const sampleH = Math.max(1, sampleY2 - sampleY1 + 1)
-  const colLuma = new Float32Array(w)
-  for (let x = leftX; x <= rightX; x += 1) {
+  // 2단계: 좌우 2열 분리 (중앙 세로 어두운 틈새 탐색)
+  const midX = Math.round((leftX + rightX) / 2)
+  let splitX = midX
+  let minColLum = Infinity
+  for (let x = midX - 80; x <= midX + 80; x += 1) {
     let s = 0
-    for (let y = sampleY1; y <= sampleY2; y += 1) {
+    for (let y = topY + Math.round(roiH * 0.2); y <= botY - 10; y += 1) {
       s += luma[y * w + x]
     }
-    colLuma[x] = s / sampleH
-  }
-
-  const vValleys = []
-  for (let x = leftX + 60; x <= rightX - 60; x += 1) {
-    let leftM = 0
-    let lc = 0
-    let rightM = 0
-    let rc = 0
-    for (let dx = -25; dx <= -5; dx += 1) {
-      if (x + dx >= leftX) {
-        leftM += colLuma[x + dx]
-        lc += 1
-      }
-    }
-    for (let dx = 5; dx <= 25; dx += 1) {
-      if (x + dx <= rightX) {
-        rightM += colLuma[x + dx]
-        rc += 1
-      }
-    }
-    if (!lc || !rc) continue
-    const vDepth = Math.min(leftM / lc - colLuma[x], rightM / rc - colLuma[x])
-    if (vDepth > 2.2) {
-      vValleys.push({ x, depth: vDepth })
+    if (s < minColLum) {
+      minColLum = s
+      splitX = x
     }
   }
 
-  vValleys.sort((a, b) => b.depth - a.depth)
-  const chosenSplits = []
-  for (let i = 0; i < vValleys.length; i += 1) {
-    const v = vValleys[i]
-    if (chosenSplits.every((sx) => Math.abs(sx - v.x) >= 120)) {
-      chosenSplits.push(v.x)
-    }
-  }
-  chosenSplits.sort((a, b) => a - b)
-  const splits = [leftX, ...chosenSplits, rightX]
+  const columns = [
+    { name: 'LEFT', x1: leftX + 4, x2: splitX - 4 },
+    { name: 'RIGHT', x1: splitX + 4, x2: rightX - 4 },
+  ]
 
   const boxes = []
-  // 가로 사진/세로 사진 크기에 비례하여 최소 층간 거리를 동적 산출
-  const minLayerGap = Math.max(22, Math.round(roiH * 0.045))
-  const winMin = Math.max(3, Math.round(minLayerGap * 0.12))
-  const winMax = Math.max(8, Math.round(minLayerGap * 0.35))
-  const valleyThresh = Math.max(1.8, 4.8 - (sensitivity / 100) * 4.0)
-  const topMargin = Math.max(24, Math.round(roiH * 0.12))
 
-  for (let c = 0; c < splits.length - 1; c += 1) {
-    const cx1 = splits[c] + 4
-    const cx2 = splits[c + 1] - 4
-    const colW = cx2 - cx1
-    if (colW < 60) continue
+  // 3단계: 각 열 내부에서 수평선 그림자 골짜기 + 박스 1단 표준 높이 비율 보정
+  for (let c = 0; c < columns.length; c += 1) {
+    const col = columns[c]
+    const colW = col.x2 - col.x1
+    if (colW < 50) continue
 
-    const midX = Math.round((cx1 + cx2) / 2)
-    const hs = Math.min(15, Math.round(colW * 0.2))
-    const sx1 = midX - hs
-    const sx2 = midX + hs
-    const sw = sx2 - sx1 + 1
+    // 열 오른쪽 모서리 부근의 은색 스테이플러 심(침) 탐색 (층수 보조 지표)
+    const stapleX1 = Math.round(col.x2 - 45)
+    const stapleX2 = Math.round(col.x2 - 8)
+    const distinctStaples = []
 
-    const rowLuma = new Float32Array(h)
-    for (let y = topY; y <= botY; y += 1) {
-      let s = 0
-      for (let x = sx1; x <= sx2; x += 1) {
-        s += luma[y * w + x]
+    for (let y = topY + 15; y <= botY - 10; y += 1) {
+      let stapleScore = 0
+      for (let x = stapleX1; x <= stapleX2; x += 1) {
+        const p = (y * w + x) * 4
+        const r = data[p]
+        const g = data[p + 1]
+        const b = data[p + 2]
+        const max = Math.max(r, g, b)
+        const min = Math.min(r, g, b)
+        const sat = max === 0 ? 0 : (max - min) / max
+        // 은색 금속 심: 채도가 낮고 밝기가 번쩍임
+        if (sat < 0.28 && luma[y * w + x] > 110) stapleScore += 1
       }
-      rowLuma[y] = s / sw
-    }
-
-    const hValleys = []
-    for (let y = topY + topMargin; y <= botY - Math.round(minLayerGap * 0.35); y += 1) {
-      let aboveSum = 0
-      let ac = 0
-      let belowSum = 0
-      let bc = 0
-      for (let dy = -winMax; dy <= -winMin; dy += 1) {
-        if (y + dy >= topY) {
-          aboveSum += rowLuma[y + dy]
-          ac += 1
+      if (stapleScore >= 4) {
+        if (distinctStaples.every((ds) => Math.abs(ds - y) >= 20)) {
+          distinctStaples.push(y)
         }
-      }
-      for (let dy = winMin; dy <= winMax; dy += 1) {
-        if (y + dy <= botY) {
-          belowSum += rowLuma[y + dy]
-          bc += 1
-        }
-      }
-      if (!ac || !bc) continue
-      const depth = Math.min(aboveSum / ac - rowLuma[y], belowSum / bc - rowLuma[y])
-      if (depth >= valleyThresh) {
-        hValleys.push({ y, depth })
       }
     }
 
-    hValleys.sort((a, b) => b.depth - a.depth)
-    const chosenY = []
-    for (let i = 0; i < hValleys.length; i += 1) {
-      const v = hValleys[i]
-      if (chosenY.every((cy) => Math.abs(cy - v.y) >= minLayerGap)) {
-        chosenY.push(v.y)
+    // 1단 표준 높이(Unit Height) 추정
+    let unitH = 0
+    if (distinctStaples.length >= 3) {
+      const gaps = []
+      for (let i = 0; i < distinctStaples.length - 1; i += 1) {
+        gaps.push(distinctStaples[i + 1] - distinctStaples[i])
       }
+      gaps.sort((a, b) => a - b)
+      unitH = gaps[Math.floor(gaps.length / 2)]
     }
-    chosenY.sort((a, b) => a - b)
 
-    // 한 열에 최소 2개 이상의 층간 틈새(즉 3층 이상)가 확인될 때만 적재 박스로 인정
-    if (chosenY.length >= 2) {
-      const yBounds = [topY, ...chosenY, botY]
-      for (let r = 0; r < yBounds.length - 1; r += 1) {
-        const y1 = yBounds[r]
-        const y2 = yBounds[r + 1]
-        const bh = y2 - y1
-        if (bh >= Math.round(minLayerGap * 0.55) && colW / bh >= 1.1) {
-          boxes.push({
-            x: cx1,
-            y: y1,
-            w: colW,
-            h: bh,
-            confidence: 0.9,
-            score: 1.2,
-          })
-        }
-      }
+    if (!unitH || unitH < 22 || unitH > Math.round(roiH * 0.4)) {
+      unitH = Math.round(roiH / 8) // 카트 적재 표준 8단 기본값
+    }
+
+    // 총 높이 비율에 의한 층수 산출 (표준 높이로 나누어 반올림: 카트 프레임에 살짝 가려진 맨 아래 박스까지 정확히 계산)
+    const targetLayers = Math.max(1, Math.min(12, Math.round(roiH / unitH)))
+    const stepH = roiH / targetLayers
+
+    for (let l = 0; l < targetLayers; l += 1) {
+      const y1 = Math.round(topY + l * stepH)
+      const y2 = Math.round(topY + (l + 1) * stepH)
+      boxes.push({
+        x: col.x1,
+        y: y1,
+        w: colW,
+        h: y2 - y1,
+        confidence: 0.95,
+        score: 1.5,
+      })
     }
   }
 
@@ -783,6 +795,23 @@ function detectVialsWithOpenCV(imageData, rawParams) {
     }
 
     const coreCandidates = detectDenseVialCores(imageData, minR, maxR, sensitivity)
+    if (coreCandidates.length >= 10) {
+      // 캡 정중앙의 어두운 원형 점(블롭)이 검출된 밀집 바이알 트레이에서는 코어 위치를 최우선으로 채택합니다.
+      // 정중앙 점이 없는 캡(은색 무점 캡 등)은 기존 원형/외곽선 후보 중 코어와 겹치지 않는 것만 보충합니다.
+      const safeMerged = [...coreCandidates]
+      const minDistance = Math.max(34, Math.round(minR * 1.5))
+      for (let i = 0; i < candidates.length; i += 1) {
+        const cand = candidates[i]
+        const overlapsWithCore = coreCandidates.some(
+          (c) => Math.hypot(cand.x - c.x, cand.y - c.y) < minDistance
+        )
+        if (!overlapsWithCore && cand.confidence >= 0.65) {
+          safeMerged.push(cand)
+        }
+      }
+      return finalizeAndSortCircles(safeMerged, w, h, minR)
+    }
+
     for (let i = 0; i < coreCandidates.length; i += 1) {
       candidates.push(coreCandidates[i])
     }
@@ -1232,6 +1261,23 @@ function detectVialsInCanvasFallback(imageData, rawParams = DEFAULT_DETECTION_PA
   }
 
   const coreCandidates = detectDenseVialCores(imageData, minR, maxR, sensitivity)
+  if (coreCandidates.length >= 10) {
+    // 캡 정중앙의 어두운 원형 점(블롭)이 검출된 밀집 바이알 트레이에서는 코어 위치를 최우선으로 채택합니다.
+    // 정중앙 점이 없는 캡(은색 무점 캡 등)은 기존 원형/외곽선 후보 중 코어와 겹치지 않는 것만 보충합니다.
+    const safeMerged = [...coreCandidates]
+    const minDistance = Math.max(34, Math.round(minR * 1.5))
+    for (let i = 0; i < candidates.length; i += 1) {
+      const cand = candidates[i]
+      const overlapsWithCore = coreCandidates.some(
+        (c) => Math.hypot(cand.x - c.x, cand.y - c.y) < minDistance
+      )
+      if (!overlapsWithCore && cand.confidence >= 0.65) {
+        safeMerged.push(cand)
+      }
+    }
+    return finalizeAndSortCircles(safeMerged, w, h, minR)
+  }
+
   for (let i = 0; i < coreCandidates.length; i += 1) {
     candidates.push(coreCandidates[i])
   }
