@@ -1,33 +1,99 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
-// 초기 가짜 부서 데이터 5줄입니다.
-// 체이스의 요청에 따라 화면 구성을 볼 수 있도록 생산팀, 포장팀, 품질팀 등의 예시 부서를 등록해 두었습니다.
-const INITIAL_DEPARTMENTS = [
-  { id: 'dept-01', name: '생산1팀', isDefault: true, icon: 'science' },
-  { id: 'dept-02', name: '생산2팀', isDefault: false, icon: 'science' },
-  { id: 'dept-03', name: '포장1팀', isDefault: false, icon: 'inventory_2' },
-  { id: 'dept-04', name: '포장2팀', isDefault: false, icon: 'inventory_2' },
-  { id: 'dept-05', name: '품질관리팀', isDefault: false, icon: 'verified' },
-]
+// 기록 화면 및 촬영 화면과 동일한 localStorage 키 공유
+export const STORAGE_DEPARTMENTS_KEY = 'jt-vial-departments'
 
-// 화면 상태(데이터 있음 / 로딩중 / 빈 상태)를 손쉽게 전환해 볼 수 있는 버튼 목록입니다.
-const VIEW_MODES = [
-  { id: 'data', label: '정상 데이터 (5건)' },
-  { id: 'loading', label: '로딩중' },
-  { id: 'empty', label: '빈 상태 (0건)' },
-]
+// JT 디자인 시스템 UX 문구 원칙(사과 없이 무엇이 잘못됐고 어떻게 해결하는지 안내)에 따른 오류 문구 생성기
+function buildSaveErrorMessage(err, targetLabel = '부서 설정') {
+  if (err?.name === 'QuotaExceededError' || err?.code === 22 || err?.code === 1014) {
+    return `브라우저 저장 공간이 가득 차서 ${targetLabel}을(를) 저장하지 못했습니다. 불필요한 이전 데이터를 정리하거나 브라우저 저장 공간을 확보한 뒤 다시 시도해 주세요.`
+  }
+  if (err?.name === 'SecurityError') {
+    return `브라우저 설정에서 기기 내 데이터 저장이 차단되어 ${targetLabel}을(를) 저장하지 못했습니다. 시크릿(비공개) 모드를 해제하거나 사이트 데이터 저장 권한을 허용한 뒤 다시 시도해 주세요.`
+  }
+  return `${targetLabel}을(를) 처리하는 중 오류가 발생했습니다(원인: ${
+    err?.message || '알 수 없는 저장소 오류'
+  }). 화면을 새로고침한 뒤 다시 시도해 주세요.`
+}
 
 export default function SettingsPage() {
-  // 화면 미리보기 상태 ('data': 정상 목록, 'loading': 로딩 중, 'empty': 부서 없음)
-  const [viewMode, setViewMode] = useState('data')
   // 신규 부서명을 입력받는 인풋 상태
   const [newDeptName, setNewDeptName] = useState('')
-  // 부서 목록 상태 (사용자가 직접 추가/삭제해볼 수 있습니다)
-  const [departments, setDepartments] = useState(INITIAL_DEPARTMENTS)
+  // 부서 목록 상태 (가짜 데이터 없이 순수 빈 배열로 시작)
+  const [departments, setDepartments] = useState([])
+  // 초기 로딩 상태
+  const [isLoading, setIsLoading] = useState(true)
 
-  const isLoading = viewMode === 'loading'
-  const isEmpty = viewMode === 'empty'
-  const currentList = isEmpty ? [] : departments
+  // 앱 내 모달 상태 (브라우저 기본 alert, confirm 대체)
+  const [modalState, setModalState] = useState({
+    isOpen: false,
+    title: '',
+    message: '',
+    isConfirm: false,
+    isDanger: false,
+    confirmText: '확인',
+    onConfirm: null,
+  })
+
+  function openAlertModal(title, message) {
+    setModalState({
+      isOpen: true,
+      title,
+      message,
+      isConfirm: false,
+      isDanger: false,
+      confirmText: '확인',
+      onConfirm: null,
+    })
+  }
+
+  function openConfirmModal({ title, message, isDanger = false, confirmText = '확인', onConfirm }) {
+    setModalState({
+      isOpen: true,
+      title,
+      message,
+      isConfirm: true,
+      isDanger,
+      confirmText,
+      onConfirm,
+    })
+  }
+
+  function closeModal() {
+    setModalState((prev) => ({ ...prev, isOpen: false, onConfirm: null }))
+  }
+
+  // 1. 컴포넌트 마운트 시 localStorage에서 실제 등록된 부서 목록만 로드 (가짜 데이터 없음)
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_DEPARTMENTS_KEY)
+      if (raw) {
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed)) {
+          setDepartments(parsed)
+        }
+      }
+    } catch (err) {
+      console.error('부서 목록 로드 실패:', err)
+      openAlertModal(
+        '저장된 부서 목록을 불러오지 못했습니다',
+        '브라우저에 저장된 부서 목록 형식이 올바르지 않습니다. 캐시를 지우거나 새로고침해 주세요.'
+      )
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
+
+  // 부서 목록 변경 시 localStorage에 영구 보존
+  function saveDepartmentsToStorage(updated) {
+    try {
+      window.localStorage.setItem(STORAGE_DEPARTMENTS_KEY, JSON.stringify(updated))
+      setDepartments(updated)
+    } catch (err) {
+      const errMsg = buildSaveErrorMessage(err, '담당 부서 목록')
+      openAlertModal('부서 설정을 저장하지 못했습니다', errMsg)
+    }
+  }
 
   // 신규 부서 추가 핸들러
   function handleAddDepartment(e) {
@@ -35,57 +101,57 @@ export default function SettingsPage() {
     const trimmed = newDeptName.trim()
     if (!trimmed) return
 
-    // 새 부서 항목 생성
+    // 중복 부서명 검사
+    if (departments.some((d) => d.name === trimmed)) {
+      openAlertModal(
+        '이미 등록된 부서입니다',
+        `"${trimmed}" 부서는 이미 등록되어 있습니다. 다른 이름을 입력해 주세요.`
+      )
+      return
+    }
+
     const newDept = {
       id: `dept-${Date.now()}`,
       name: trimmed,
-      isDefault: departments.length === 0,
+      isDefault: departments.length === 0, // 첫 번째 등록 부서는 자동 기본 부서 지정
       icon: 'business',
     }
 
-    setDepartments((prev) => [...prev, newDept])
+    const updated = [...departments, newDept]
+    saveDepartmentsToStorage(updated)
     setNewDeptName('')
-    if (viewMode === 'empty') {
-      setViewMode('data')
-    }
   }
 
-  // 부서 삭제 핸들러
-  function handleDeleteDepartment(id) {
-    setDepartments((prev) => prev.filter((dept) => dept.id !== id))
+  // 부서 삭제 핸들러 (앱 내 모달 확인 후 삭제)
+  function handleDeleteDepartment(deptToDelete) {
+    openConfirmModal({
+      title: '담당 부서 삭제',
+      message: `"${deptToDelete.name}" 부서를 삭제하시겠습니까? [기록] 화면의 부서 선택 목록에서도 제외됩니다.`,
+      isDanger: true,
+      confirmText: '부서 삭제',
+      onConfirm: () => {
+        const filtered = departments.filter((dept) => dept.id !== deptToDelete.id)
+        // 삭제하려는 부서가 기본 부서였고 다른 부서가 남아있다면 첫 번째 부서를 기본으로 승격
+        if (deptToDelete.isDefault && filtered.length > 0) {
+          filtered[0].isDefault = true
+        }
+        saveDepartmentsToStorage(filtered)
+      },
+    })
   }
 
   // 기본 부서 설정 핸들러
   function handleSetDefault(id) {
-    setDepartments((prev) =>
-      prev.map((dept) => ({
-        ...dept,
-        isDefault: dept.id === id,
-      }))
-    )
+    const updated = departments.map((dept) => ({
+      ...dept,
+      isDefault: dept.id === id,
+    }))
+    saveDepartmentsToStorage(updated)
   }
 
   return (
     <>
-      {/* 1. 디자인 및 상태를 바로 확인할 수 있는 상태 스위처 (정식 데이터 연결 시 자동 전환됩니다) */}
-      <div className="jt-row" style={{ justifyContent: 'space-between' }}>
-        <span className="jt-help">화면 상태 확인</span>
-        <div className="jt-switcher" role="group" aria-label="화면 상태 확인">
-          {VIEW_MODES.map((mode) => (
-            <button
-              key={mode.id}
-              type="button"
-              className="jt-switcher-item"
-              aria-pressed={viewMode === mode.id}
-              onClick={() => setViewMode(mode.id)}
-            >
-              {mode.label}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* 2. "부서 입력 및 관리" 메인 설정 카드 */}
+      {/* 1. "부서 입력 및 관리" 메인 설정 카드 */}
       <section
         className="jt-card jt-stack-4"
         aria-label="부서 설정"
@@ -96,7 +162,7 @@ export default function SettingsPage() {
               담당 부서 설정
             </h2>
             <span className="jt-badge" style={{ alignSelf: 'center' }}>
-              {currentList.length}개 등록됨
+              {isLoading ? '조회 중' : `${departments.length}개 등록됨`}
             </span>
           </div>
           <p className="jt-help" style={{ margin: 0 }}>
@@ -114,6 +180,7 @@ export default function SettingsPage() {
             onChange={(e) => setNewDeptName(e.target.value)}
             style={{ flex: 1 }}
             aria-label="새 부서명 입력"
+            disabled={isLoading}
           />
           <button type="submit" className="jt-btn" disabled={!newDeptName.trim() || isLoading}>
             <span className="jt-ico" aria-hidden="true">
@@ -123,7 +190,7 @@ export default function SettingsPage() {
           </button>
         </form>
 
-        {/* 등록된 부서 목록: 로딩 상태 / 빈 상태 / 가짜 데이터 5줄 리스트 */}
+        {/* 등록된 부서 목록: 로딩 상태 / 빈 상태 / 등록된 부서 카드 목록 */}
         <div style={{ marginTop: 'var(--space-2)' }}>
           {isLoading ? (
             /* 로딩 상태: 스켈레톤 화면 */
@@ -139,7 +206,7 @@ export default function SettingsPage() {
                 />
               ))}
             </div>
-          ) : currentList.length === 0 ? (
+          ) : departments.length === 0 ? (
             /* 빈 상태: 등록된 부서가 없을 때 안내 화면 */
             <div
               className="jt-empty"
@@ -158,9 +225,9 @@ export default function SettingsPage() {
               </p>
             </div>
           ) : (
-            /* 가짜 데이터 5줄: 등록된 부서 카드 목록 */
+            /* 등록된 부서 카드 목록 */
             <div className="jt-stack-2">
-              <span className="jt-help">등록된 부서 목록 (가짜 데이터 5줄)</span>
+              <span className="jt-help">등록된 부서 목록</span>
               <ul
                 style={{
                   listStyle: 'none',
@@ -171,7 +238,7 @@ export default function SettingsPage() {
                   gap: 'var(--space-2)',
                 }}
               >
-                {currentList.map((dept) => (
+                {departments.map((dept) => (
                   <li
                     key={dept.id}
                     className="jt-row"
@@ -186,7 +253,7 @@ export default function SettingsPage() {
                   >
                     <div className="jt-row" style={{ gap: 'var(--space-3)', alignItems: 'center' }}>
                       <span className="jt-ico" aria-hidden="true">
-                        {dept.icon}
+                        {dept.icon || 'business'}
                       </span>
                       <strong style={{ fontSize: 'var(--fs-base)' }}>{dept.name}</strong>
                       {dept.isDefault && (
@@ -214,7 +281,7 @@ export default function SettingsPage() {
                       <button
                         type="button"
                         className="jt-icon-btn"
-                        onClick={() => handleDeleteDepartment(dept.id)}
+                        onClick={() => handleDeleteDepartment(dept)}
                         aria-label={`${dept.name} 삭제`}
                         title="부서 삭제"
                       >
@@ -231,7 +298,7 @@ export default function SettingsPage() {
         </div>
       </section>
 
-      {/* 3. 추후 추가될 추가 설정 영역 안내 카드 */}
+      {/* 2. 추후 추가될 추가 설정 영역 안내 카드 */}
       <section
         className="jt-card jt-stack-3"
         aria-label="추가 설정 안내"
@@ -252,6 +319,82 @@ export default function SettingsPage() {
           바이알 트레이 규격(기본 수량 100개/50개), AI 인식 감도 조절, 자동 저장 옵션 등이 다음 단계에서 이곳에 추가될 예정입니다.
         </p>
       </section>
+
+      {/* 앱 내 확인/알림 모달 (브라우저 기본 alert, confirm 대체) */}
+      {modalState.isOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="settings-modal-title"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'var(--color-overlay)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 'var(--z-modal)',
+            padding: 'var(--space-4)',
+          }}
+        >
+          <div
+            className="jt-card jt-stack-4"
+            style={{
+              width: '100%',
+              maxWidth: '24rem',
+              boxShadow: 'var(--shadow-lg)',
+            }}
+          >
+            <div className="jt-row" style={{ gap: 'var(--space-2)', alignItems: 'center' }}>
+              <span
+                className="jt-ico"
+                aria-hidden="true"
+                style={{
+                  color: modalState.isDanger ? 'var(--color-error)' : 'var(--color-accent)',
+                }}
+              >
+                {modalState.isDanger ? 'warning' : 'info'}
+              </span>
+              <h3 id="settings-modal-title" style={{ margin: 0, fontSize: 'var(--fs-base)', fontWeight: 700 }}>
+                {modalState.title}
+              </h3>
+            </div>
+            <p style={{ margin: 0, fontSize: 'var(--fs-sm)', lineHeight: 1.6 }}>
+              {modalState.message}
+            </p>
+            <div className="jt-row" style={{ justifyContent: 'flex-end', gap: 'var(--space-2)' }}>
+              {modalState.isConfirm && (
+                <button
+                  type="button"
+                  className="jt-btn"
+                  style={{
+                    backgroundColor: 'transparent',
+                    color: 'var(--color-text)',
+                    border: '1px solid var(--color-border)',
+                  }}
+                  onClick={closeModal}
+                >
+                  취소
+                </button>
+              )}
+              <button
+                type="button"
+                className="jt-btn"
+                style={{
+                  backgroundColor: modalState.isDanger ? 'var(--color-error)' : undefined,
+                  color: modalState.isDanger ? 'var(--color-text-inverse)' : undefined,
+                }}
+                onClick={() => {
+                  if (modalState.onConfirm) modalState.onConfirm()
+                  closeModal()
+                }}
+              >
+                {modalState.confirmText || '확인'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   )
 }

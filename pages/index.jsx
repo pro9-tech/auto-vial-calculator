@@ -16,6 +16,7 @@ const MAX_PHOTOS_PER_MODE = 5
 // 기본 설정 및 기록 저장소 키
 const STORAGE_VIALS_PER_BOX_KEY = 'jt-vials-per-box'
 const STORAGE_RECORDS_KEY = 'jt-vial-records'
+const STORAGE_DEPARTMENTS_KEY = 'jt-vial-departments'
 const DEFAULT_VIALS_PER_BOX = '50'
 
 // 파일 크기를 읽기 쉬운 MB/KB 단위로 변환합니다.
@@ -789,12 +790,27 @@ export default function CapturePage() {
         now.getHours()
       )}:${pad(now.getMinutes())}`
 
+      // 설정 화면에서 등록된 기본 부서 가져오기 (등록된 부서가 없으면 빈 문자열)
+      let defaultTeam = ''
+      try {
+        const rawDepts = window.localStorage.getItem(STORAGE_DEPARTMENTS_KEY)
+        if (rawDepts) {
+          const parsedDepts = JSON.parse(rawDepts)
+          if (Array.isArray(parsedDepts) && parsedDepts.length > 0) {
+            const def = parsedDepts.find((d) => d.isDefault) || parsedDepts[0]
+            if (def?.name) defaultTeam = def.name
+          }
+        }
+      } catch (e) {
+        // 부서 읽기 오류 시 미지정 유지
+      }
+
       const newRecord = {
         id: `INS-${Date.now()}`,
         date: formattedDate,
         productName: '현장 촬영 검수',
         round: '1차',
-        team: '생산1팀',
+        team: defaultTeam,
         count: grandTotalVials,
         capCount: totalCapVials,
         boxCount: totalBoxes,

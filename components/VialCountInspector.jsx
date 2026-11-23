@@ -3,8 +3,8 @@ import { useEffect, useRef, useState } from 'react'
 // 가로 1200 리사이징 기준 기본 검출 보정 파라미터입니다.
 export const DEFAULT_DETECTION_PARAMS = {
   sensitivity: 55,
-  minRadius: 14,
-  maxRadius: 85,
+  minRadius: 15,
+  maxRadius: 48,
 }
 
 // 박스 모드(사각형 윤곽선 검출)용 기본 보정 파라미터입니다.
@@ -190,11 +190,325 @@ export async function prepareAnalysisImageData(previewUrl) {
   }
 }
 
+// 큰 가짜 원 내부에 2개 이상의 작은 원 후보가 포함되어 있으면 큰 가짜 원을 제거합니다.
+function resolveNestedCircles(rawCircles) {
+  if (!rawCircles || rawCircles.length <= 2) return rawCircles || []
+  return rawCircles.filter((big, idx) => {
+    let innerCount = 0
+    for (let j = 0; j < rawCircles.length; j += 1) {
+      if (idx === j) continue
+      const small = rawCircles[j]
+      if (small.r >= big.r * 0.72) continue
+      const dist = Math.hypot(big.x - small.x, big.y - small.y)
+      if (dist + small.r * 0.45 <= big.r) {
+        innerCount += 1
+        if (innerCount >= 2) return false
+      }
+    }
+    return true
+  })
+}
+
+// 밀집 바이알 트레이 특화: 적분 이미지 기반 중앙 어두운 코어 + 밝은 주변 링(Core-Ring DoG) 피크 검출
+function detectDenseVialCores(imageData, minR, maxR, sensitivity) {
+  const { width: w, height: h, data } = imageData
+  if (!w || !h || !data) return []
+
+  const n = w * h
+  const gray = new Float32Array(n)
+  for (let i = 0; i < n; i += 1) {
+    const p = i * 4
+    gray[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]
+  }
+
+  const iw = w + 1
+  const integral = new Float64Array(iw * (h + 1))
+  for (let y = 0; y < h; y += 1) {
+    let rowSum = 0
+    const gRow = y * w
+    const iPrev = y * iw
+    const iCurr = (y + 1) * iw
+    for (let x = 0; x < w; x += 1) {
+      rowSum += gray[gRow + x]
+      integral[iCurr + x + 1] = integral[iPrev + x + 1] + rowSum
+    }
+  }
+
+  const boxMean = (cx, cy, r) => {
+    const x1 = Math.max(0, Math.floor(cx - r))
+    const y1 = Math.max(0, Math.floor(cy - r))
+    const x2 = Math.min(w - 1, Math.ceil(cx + r))
+    const y2 = Math.min(h - 1, Math.ceil(cy + r))
+    const area = (x2 - x1 + 1) * (y2 - y1 + 1)
+    if (area <= 0) return 0
+    return (
+      (integral[(y2 + 1) * iw + (x2 + 1)] -
+        integral[y1 * iw + (x2 + 1)] -
+        integral[(y2 + 1) * iw + x1] +
+        integral[y1 * iw + x1]) /
+      area
+    )
+  }
+
+  const estR = Math.max(10, Math.round((minR + maxR) * 0.53))
+  const rCore = Math.max(3, Math.round(estR * 0.18))
+  const rRing = Math.max(rCore + 4, Math.round(estR * 0.72))
+  const rOuter = Math.round(estR * 0.95)
+  if (w <= rOuter * 2 + 4 || h <= rOuter * 2 + 4) return []
+
+  const areaCore = (2 * rCore + 1) ** 2
+  const areaMid = (2 * rRing + 1) ** 2
+  const scoreMap = new Float32Array(n)
+  const contrastThresh = Math.max(12, 42 - (sensitivity / 100) * 32)
+  const sampleDist = Math.round(estR * 0.56)
+
+  for (let y = rOuter; y < h - rOuter; y += 2) {
+    for (let x = rOuter; x < w - rOuter; x += 2) {
+      const core = boxMean(x, y, rCore)
+      const mid = boxMean(x, y, rRing)
+      const ring = (mid * areaMid - core * areaCore) / Math.max(1, areaMid - areaCore)
+      const diff = ring - core
+      if (diff < contrastThresh || ring < 108 || core > 148) continue
+
+      let brightDirs = 0
+      for (let k = 0; k < 8; k += 1) {
+        const ang = (k * Math.PI) / 4
+        const sx = Math.round(x + sampleDist * Math.cos(ang))
+        const sy = Math.round(y + sampleDist * Math.sin(ang))
+        const val = gray[sy * w + sx]
+        if (val > core + diff * 0.4 && val > 105) {
+          brightDirs += 1
+        }
+      }
+      if (brightDirs >= 6) {
+        scoreMap[y * w + x] = diff * (brightDirs / 8)
+      }
+    }
+  }
+
+  const candidates = []
+  const nmsR = Math.max(8, Math.round(estR * 1.05))
+  for (let y = rOuter; y < h - rOuter; y += 2) {
+    for (let x = rOuter; x < w - rOuter; x += 2) {
+      const s = scoreMap[y * w + x]
+      if (s <= 0) continue
+
+      let isMax = true
+      for (let dy = -nmsR; dy <= nmsR && isMax; dy += 2) {
+        const yy = y + dy
+        if (yy < 0 || yy >= h) continue
+        const row = yy * w
+        for (let dx = -nmsR; dx <= nmsR; dx += 2) {
+          if (dx === 0 && dy === 0) continue
+          if (dx * dx + dy * dy > nmsR * nmsR) continue
+          const xx = x + dx
+          if (xx < 0 || xx >= w) continue
+          if (scoreMap[row + xx] > s) {
+            isMax = false
+            break
+          }
+        }
+      }
+      if (isMax) {
+        candidates.push({
+          x,
+          y,
+          r: estR,
+          confidence: Math.min(1, 0.72 + Math.min(0.26, s / 180)),
+          score: 1.15 + Math.min(0.5, s / 160),
+        })
+      }
+    }
+  }
+
+  return candidates
+}
+
+// 카트 적재 박스 특화: 수직 열 분리 + V자 수평 틈새 골짜기 분할 검출기
+function detectStackedCartBoxes(imageData, sensitivity = 55) {
+  const { width: w, height: h, data } = imageData
+  if (!w || !h || !data || w < 120 || h < 120) return []
+
+  const rowChroma = new Float32Array(h)
+  const colChroma = new Float32Array(w)
+  const luma = new Float32Array(w * h)
+
+  for (let y = 0; y < h; y += 1) {
+    let cSum = 0
+    for (let x = 0; x < w; x += 1) {
+      const p = (y * w + x) * 4
+      const r = data[p]
+      const g = data[p + 1]
+      const b = data[p + 2]
+      const ch = Math.max(r, g, b) - Math.min(r, g, b)
+      cSum += ch
+      colChroma[x] += ch
+      luma[y * w + x] = 0.299 * r + 0.587 * g + 0.114 * b
+    }
+    rowChroma[y] = cSum / w
+  }
+
+  let topY = -1
+  let botY = -1
+  for (let y = 0; y < h; y += 1) {
+    if (rowChroma[y] > 26) {
+      if (topY === -1) topY = y
+      botY = y
+    }
+  }
+
+  let leftX = -1
+  let rightX = -1
+  for (let x = 0; x < w; x += 1) {
+    if (colChroma[x] / h > 11) {
+      if (leftX === -1) leftX = x
+      rightX = x
+    }
+  }
+
+  if (topY === -1 || leftX === -1 || botY - topY < 80 || rightX - leftX < 80) {
+    return []
+  }
+
+  // 앞면 적재부(40% ~ 92%)에서 수직 열 경계 틈새 탐색
+  const sampleY1 = Math.round(topY + (botY - topY) * 0.4)
+  const sampleY2 = Math.round(topY + (botY - topY) * 0.92)
+  const sampleH = Math.max(1, sampleY2 - sampleY1 + 1)
+  const colLuma = new Float32Array(w)
+  for (let x = leftX; x <= rightX; x += 1) {
+    let s = 0
+    for (let y = sampleY1; y <= sampleY2; y += 1) {
+      s += luma[y * w + x]
+    }
+    colLuma[x] = s / sampleH
+  }
+
+  const vValleys = []
+  for (let x = leftX + 60; x <= rightX - 60; x += 1) {
+    let leftM = 0
+    let lc = 0
+    let rightM = 0
+    let rc = 0
+    for (let dx = -25; dx <= -5; dx += 1) {
+      if (x + dx >= leftX) {
+        leftM += colLuma[x + dx]
+        lc += 1
+      }
+    }
+    for (let dx = 5; dx <= 25; dx += 1) {
+      if (x + dx <= rightX) {
+        rightM += colLuma[x + dx]
+        rc += 1
+      }
+    }
+    if (!lc || !rc) continue
+    const vDepth = Math.min(leftM / lc - colLuma[x], rightM / rc - colLuma[x])
+    if (vDepth > 5.5) {
+      vValleys.push({ x, depth: vDepth })
+    }
+  }
+
+  vValleys.sort((a, b) => b.depth - a.depth)
+  const chosenSplits = []
+  for (let i = 0; i < vValleys.length; i += 1) {
+    const v = vValleys[i]
+    if (chosenSplits.every((sx) => Math.abs(sx - v.x) >= 120)) {
+      chosenSplits.push(v.x)
+    }
+  }
+  chosenSplits.sort((a, b) => a - b)
+  const splits = [leftX, ...chosenSplits, rightX]
+
+  const boxes = []
+  const valleyThresh = Math.max(1.8, 4.8 - (sensitivity / 100) * 4.0)
+
+  for (let c = 0; c < splits.length - 1; c += 1) {
+    const cx1 = splits[c] + 4
+    const cx2 = splits[c + 1] - 4
+    const colW = cx2 - cx1
+    if (colW < 60) continue
+
+    // 기울기 영향을 최소화하기 위해 열 중앙 31px 좁은 세로 띠에서 밝기 프로파일 추출
+    const midX = Math.round((cx1 + cx2) / 2)
+    const hs = Math.min(15, Math.round(colW * 0.2))
+    const sx1 = midX - hs
+    const sx2 = midX + hs
+    const sw = sx2 - sx1 + 1
+
+    const rowLuma = new Float32Array(h)
+    for (let y = topY; y <= botY; y += 1) {
+      let s = 0
+      for (let x = sx1; x <= sx2; x += 1) {
+        s += luma[y * w + x]
+      }
+      rowLuma[y] = s / sw
+    }
+
+    const hValleys = []
+    for (let y = topY + 25; y <= botY - 18; y += 1) {
+      let aboveSum = 0
+      let ac = 0
+      let belowSum = 0
+      let bc = 0
+      for (let dy = -16; dy <= -4; dy += 1) {
+        if (y + dy >= topY) {
+          aboveSum += rowLuma[y + dy]
+          ac += 1
+        }
+      }
+      for (let dy = 4; dy <= 16; dy += 1) {
+        if (y + dy <= botY) {
+          belowSum += rowLuma[y + dy]
+          bc += 1
+        }
+      }
+      if (!ac || !bc) continue
+      const depth = Math.min(aboveSum / ac - rowLuma[y], belowSum / bc - rowLuma[y])
+      if (depth >= valleyThresh) {
+        hValleys.push({ y, depth })
+      }
+    }
+
+    hValleys.sort((a, b) => b.depth - a.depth)
+    const chosenY = []
+    for (let i = 0; i < hValleys.length; i += 1) {
+      const v = hValleys[i]
+      if (chosenY.every((cy) => Math.abs(cy - v.y) >= 48)) {
+        chosenY.push(v.y)
+      }
+    }
+    chosenY.sort((a, b) => a - b)
+
+    // 한 열에 최소 2개 이상의 층간 틈새(즉 3층 이상)가 확인될 때만 적재 박스로 인정
+    if (chosenY.length >= 2) {
+      const yBounds = [topY, ...chosenY, botY]
+      for (let r = 0; r < yBounds.length - 1; r += 1) {
+        const y1 = yBounds[r]
+        const y2 = yBounds[r + 1]
+        const bh = y2 - y1
+        if (bh >= 25 && colW / bh >= 1.1) {
+          boxes.push({
+            x: cx1,
+            y: y1,
+            w: colW,
+            h: bh,
+            confidence: 0.9,
+            score: 1.2,
+          })
+        }
+      }
+    }
+  }
+
+  return boxes
+}
+
 // 원형 동심원 억제(NMS) 및 행·열 번호 정렬
 function finalizeAndSortCircles(rawCircles, w, h, minR) {
   if (!rawCircles || rawCircles.length === 0) return []
 
-  const sorted = [...rawCircles].sort((a, b) => (b.score || 0) - (a.score || 0))
+  const filteredNested = resolveNestedCircles(rawCircles)
+  const sorted = [...filteredNested].sort((a, b) => (b.score || 0) - (a.score || 0))
   const accepted = []
 
   for (let i = 0; i < sorted.length; i += 1) {
@@ -203,7 +517,7 @@ function finalizeAndSortCircles(rawCircles, w, h, minR) {
     for (let j = 0; j < accepted.length; j += 1) {
       const k = accepted[j]
       const dist = Math.hypot(c.x - k.x, c.y - k.y)
-      if (dist < (c.r + k.r) * 0.8) {
+      if (dist < Math.min(c.r, k.r) * 1.48) {
         overlaps = true
         break
       }
@@ -441,6 +755,11 @@ function detectVialsWithOpenCV(imageData, rawParams) {
       }
     }
 
+    const coreCandidates = detectDenseVialCores(imageData, minR, maxR, sensitivity)
+    for (let i = 0; i < coreCandidates.length; i += 1) {
+      candidates.push(coreCandidates[i])
+    }
+
     return finalizeAndSortCircles(candidates, w, h, minR)
   } finally {
     if (src) src.delete()
@@ -463,6 +782,12 @@ function detectBoxesWithOpenCV(imageData, rawBoxParams) {
   const minS = Math.max(16, Math.min(rawMinS, rawMaxS - 10))
   const maxS = Math.max(minS + 10, rawMaxS)
 
+  // 카트에 수직으로 여러 단이 적재된 박스 패턴이 확인되면 열·단 분할 엔진 결과를 우선 사용합니다.
+  const stackedBoxes = detectStackedCartBoxes(imageData, sensitivity)
+  if (stackedBoxes.length >= 3) {
+    return finalizeAndSortBoxes(stackedBoxes, w, h)
+  }
+
   let src = null
   let gray = null
   let blurred = null
@@ -480,11 +805,12 @@ function detectBoxesWithOpenCV(imageData, rawBoxParams) {
 
   const inspectContour = (cnt) => {
     const rect = cv.boundingRect(cnt)
-    if (rect.width < minS || rect.height < minS || rect.width > maxS || rect.height > maxS) return
+    const minH = Math.max(12, Math.round(minS * 0.28))
+    if (rect.width < minS || rect.height < minH || rect.width > maxS || rect.height > maxS) return
     if (rect.width > w * 0.92 && rect.height > h * 0.92) return
 
     const aspect = rect.width / Math.max(1, rect.height)
-    if (aspect < 0.22 || aspect > 4.5) return
+    if (aspect < 0.12 || aspect > 22.0) return
 
     const area = cv.contourArea(cnt)
     const bboxArea = rect.width * rect.height
@@ -878,6 +1204,11 @@ function detectVialsInCanvasFallback(imageData, rawParams = DEFAULT_DETECTION_PA
     }
   }
 
+  const coreCandidates = detectDenseVialCores(imageData, minR, maxR, sensitivity)
+  for (let i = 0; i < coreCandidates.length; i += 1) {
+    candidates.push(coreCandidates[i])
+  }
+
   return finalizeAndSortCircles(candidates, w, h, minR)
 }
 
@@ -891,6 +1222,12 @@ function detectBoxesInCanvasFallback(imageData, rawBoxParams = DEFAULT_BOX_PARAM
   const rawMaxS = Number(rawBoxParams?.maxSize ?? 550)
   const minS = Math.max(16, Math.min(rawMinS, rawMaxS - 10))
   const maxS = Math.max(minS + 10, rawMaxS)
+
+  // 카트에 수직으로 여러 단이 적재된 박스 패턴이 확인되면 열·단 분할 엔진 결과를 우선 사용합니다.
+  const stackedBoxes = detectStackedCartBoxes(imageData, sensitivity)
+  if (stackedBoxes.length >= 3) {
+    return finalizeAndSortBoxes(stackedBoxes, w, h)
+  }
 
   // 연산 속도를 위해 절반 비율(가로 최대 600)로 다운샘플해 전경 영역과 4변 그라디언트를 분석합니다.
   const workScale = w > 600 ? 0.5 : 1
@@ -1078,12 +1415,13 @@ function detectBoxesInCanvasFallback(imageData, rawBoxParams = DEFAULT_BOX_PARAM
       const sbh = maxY - minY + 1
       const rw = Math.round(sbw / workScale)
       const rh = Math.round(sbh / workScale)
+      const minH = Math.max(12, Math.round(minS * 0.28))
 
-      if (rw < minS || rh < minS || rw > maxS || rh > maxS) continue
+      if (rw < minS || rh < minH || rw > maxS || rh > maxS) continue
       if (rw > w * 0.92 && rh > h * 0.92) continue
 
       const aspect = rw / Math.max(1, rh)
-      if (aspect < 0.22 || aspect > 4.5) continue
+      if (aspect < 0.12 || aspect > 22.0) continue
 
       const fillRatio = area / Math.max(1, sbw * sbh)
       if (fillRatio < 0.14) continue
