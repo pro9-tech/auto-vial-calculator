@@ -605,54 +605,58 @@ export default function CapturePage() {
     runSequentialAnalysis(capPhotos, boxPhotos, capParams, boxParams)
   }
 
-  // 캡 뚜껑 모드 슬라이더 실시간 디바운스 보정
+  // 캡 뚜껑 모드 슬라이더 실시간 디바운스 보정 (280ms 디바운스 + 비동기 분리로 렉 제거)
   function handleChangeCapParams(nextParams) {
     setCapParams(nextParams)
     setHasSaved(false)
 
     if (sliderDebounceRef.current) clearTimeout(sliderDebounceRef.current)
     sliderDebounceRef.current = setTimeout(() => {
-      setCapPhotos((prev) => {
-        const targetId = activePhotoKey?.mode === 'cap' ? activePhotoKey.id : prev[0]?.id
-        return prev.map((photo) => {
-          if (!photo.imageData) return photo
-          if (applyScope === 'active' && photo.id !== targetId) return photo
+      window.requestAnimationFrame(() => {
+        setCapPhotos((prev) => {
+          const targetId = activePhotoKey?.mode === 'cap' ? activePhotoKey.id : prev[0]?.id
+          return prev.map((photo) => {
+            if (!photo.imageData) return photo
+            if (applyScope === 'active' && photo.id !== targetId) return photo
 
-          const circles = detectVialsInImageData(photo.imageData, nextParams)
-          return {
-            ...photo,
-            circles,
-            count: circles.length,
-            engine: isOpenCvReady() ? 'opencv' : 'canvas',
-          }
+            const circles = detectVialsInImageData(photo.imageData, nextParams)
+            return {
+              ...photo,
+              circles,
+              count: circles.length,
+              engine: isOpenCvReady() ? 'opencv' : 'canvas',
+            }
+          })
         })
       })
-    }, 70)
+    }, 280)
   }
 
-  // 박스 모드 슬라이더 실시간 디바운스 보정
+  // 박스 모드 슬라이더 실시간 디바운스 보정 (280ms 디바운스 + 비동기 분리로 렉 제거)
   function handleChangeBoxParams(nextParams) {
     setBoxParams(nextParams)
     setHasSaved(false)
 
     if (sliderDebounceRef.current) clearTimeout(sliderDebounceRef.current)
     sliderDebounceRef.current = setTimeout(() => {
-      setBoxPhotos((prev) => {
-        const targetId = activePhotoKey?.mode === 'box' ? activePhotoKey.id : prev[0]?.id
-        return prev.map((photo) => {
-          if (!photo.imageData) return photo
-          if (applyScope === 'active' && photo.id !== targetId) return photo
+      window.requestAnimationFrame(() => {
+        setBoxPhotos((prev) => {
+          const targetId = activePhotoKey?.mode === 'box' ? activePhotoKey.id : prev[0]?.id
+          return prev.map((photo) => {
+            if (!photo.imageData) return photo
+            if (applyScope === 'active' && photo.id !== targetId) return photo
 
-          const boxes = detectBoxesInImageData(photo.imageData, nextParams)
-          return {
-            ...photo,
-            boxes,
-            count: boxes.length,
-            engine: isOpenCvReady() ? 'opencv' : 'canvas',
-          }
+            const boxes = detectBoxesInImageData(photo.imageData, nextParams)
+            return {
+              ...photo,
+              boxes,
+              count: boxes.length,
+              engine: isOpenCvReady() ? 'opencv' : 'canvas',
+            }
+          })
         })
       })
-    }, 70)
+    }, 280)
   }
 
   function handleResetParams(mode) {

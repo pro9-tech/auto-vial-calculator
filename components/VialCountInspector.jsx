@@ -253,75 +253,76 @@ function detectDenseVialCores(imageData, minR, maxR, sensitivity) {
   const estR = Math.max(10, Math.round((minR + maxR) * 0.53))
   const rCore = Math.max(3, Math.round(estR * 0.18))
   const rRing = Math.max(rCore + 4, Math.round(estR * 0.72))
-  const rOuter = Math.round(estR * 0.95)
+  const rOuter = Math.round(estR * 1.1)
   if (w <= rOuter * 2 + 4 || h <= rOuter * 2 + 4) return []
 
   const areaCore = (2 * rCore + 1) ** 2
   const areaMid = (2 * rRing + 1) ** 2
-  const scoreMap = new Float32Array(n)
-  const contrastThresh = Math.max(12, 42 - (sensitivity / 100) * 32)
+  const contrastThresh = Math.max(12, 40 - (sensitivity / 100) * 28)
   const sampleDist = Math.round(estR * 0.56)
 
-  for (let y = rOuter; y < h - rOuter; y += 2) {
-    for (let x = rOuter; x < w - rOuter; x += 2) {
+  // 10x10 타일 블록당 최고 점수 1개만 추출해 NMS 연산을 100배 가속 (슬라이더 렉 방지)
+  const tileSize = 10
+  const tilesX = Math.ceil(w / tileSize)
+  const tilesY = Math.ceil(h / tileSize)
+  const tileBest = new Array(tilesX * tilesY).fill(null)
+
+  for (let y = rOuter; y < h - rOuter; y += 3) {
+    const ty = (y / tileSize) | 0
+    for (let x = rOuter; x < w - rOuter; x += 3) {
       const core = boxMean(x, y, rCore)
+      if (core > 145) continue
+
       const mid = boxMean(x, y, rRing)
       const ring = (mid * areaMid - core * areaCore) / Math.max(1, areaMid - areaCore)
       const diff = ring - core
-      if (diff < contrastThresh || ring < 108 || core > 148) continue
+      if (diff < contrastThresh || ring < 108) continue
 
+      // 8방향 링 대칭성 + 외곽 원형 윤곽선 경계(안쪽 0.78R vs 바깥쪽 1.08R) 동시 검증
       let brightDirs = 0
-      for (let k = 0; k < 8; k += 1) {
-        const ang = (k * Math.PI) / 4
-        const sx = Math.round(x + sampleDist * Math.cos(ang))
-        const sy = Math.round(y + sampleDist * Math.sin(ang))
-        const val = gray[sy * w + sx]
-        if (val > core + diff * 0.4 && val > 105) {
+      let edgeHits = 0
+      let quadMask = 0
+
+      for (let k = 0; k < ANGLE_SAMPLES; k += 3) {
+        const cosK = COS_TABLE[k]
+        const sinK = SIN_TABLE[k]
+
+        const ix = Math.round(x + sampleDist * cosK)
+        const iy = Math.round(y + sampleDist * sinK)
+        const iv = gray[iy * w + ix]
+        if (iv > core + diff * 0.4 && iv > 105) {
           brightDirs += 1
         }
-      }
-      if (brightDirs >= 6) {
-        scoreMap[y * w + x] = diff * (brightDirs / 8)
-      }
-    }
-  }
 
-  const candidates = []
-  const nmsR = Math.max(8, Math.round(estR * 1.05))
-  for (let y = rOuter; y < h - rOuter; y += 2) {
-    for (let x = rOuter; x < w - rOuter; x += 2) {
-      const s = scoreMap[y * w + x]
-      if (s <= 0) continue
+        const rxIn = Math.round(x + estR * 0.78 * cosK)
+        const ryIn = Math.round(y + estR * 0.78 * sinK)
+        const rxOut = Math.round(x + estR * 1.08 * cosK)
+        const ryOut = Math.round(y + estR * 1.08 * sinK)
+        if (gray[ryIn * w + rxIn] - gray[ryOut * w + rxOut] > 12) {
+          edgeHits += 1
+          quadMask |= 1 << ((k / 6) | 0)
+        }
+      }
 
-      let isMax = true
-      for (let dy = -nmsR; dy <= nmsR && isMax; dy += 2) {
-        const yy = y + dy
-        if (yy < 0 || yy >= h) continue
-        const row = yy * w
-        for (let dx = -nmsR; dx <= nmsR; dx += 2) {
-          if (dx === 0 && dy === 0) continue
-          if (dx * dx + dy * dy > nmsR * nmsR) continue
-          const xx = x + dx
-          if (xx < 0 || xx >= w) continue
-          if (scoreMap[row + xx] > s) {
-            isMax = false
-            break
+      if (brightDirs >= 6 && edgeHits >= 4 && countBits4(quadMask) >= 3) {
+        const rawScore = diff * (brightDirs / 8) * (0.6 + 0.4 * (edgeHits / 8))
+        const tx = (x / tileSize) | 0
+        const tid = ty * tilesX + tx
+        if (!tileBest[tid] || rawScore > tileBest[tid].rawScore) {
+          tileBest[tid] = {
+            x,
+            y,
+            r: estR,
+            rawScore,
+            confidence: Math.min(1, 0.75 + Math.min(0.24, rawScore / 180)),
+            score: 1.15 + Math.min(0.5, rawScore / 160),
           }
         }
       }
-      if (isMax) {
-        candidates.push({
-          x,
-          y,
-          r: estR,
-          confidence: Math.min(1, 0.72 + Math.min(0.26, s / 180)),
-          score: 1.15 + Math.min(0.5, s / 160),
-        })
-      }
     }
   }
 
-  return candidates
+  return tileBest.filter(Boolean)
 }
 
 // 카트 적재 박스 특화: 수직 열 분리 + V자 수평 틈새 골짜기 분할 검출기
@@ -330,7 +331,7 @@ function detectStackedCartBoxes(imageData, sensitivity = 55) {
   if (!w || !h || !data || w < 120 || h < 120) return []
 
   const rowChroma = new Float32Array(h)
-  const colChroma = new Float32Array(w)
+  const colChromaCount = new Float32Array(w)
   const luma = new Float32Array(w * h)
 
   for (let y = 0; y < h; y += 1) {
@@ -342,7 +343,7 @@ function detectStackedCartBoxes(imageData, sensitivity = 55) {
       const b = data[p + 2]
       const ch = Math.max(r, g, b) - Math.min(r, g, b)
       cSum += ch
-      colChroma[x] += ch
+      if (ch > 30) colChromaCount[x] += 1
       luma[y * w + x] = 0.299 * r + 0.587 * g + 0.114 * b
     }
     rowChroma[y] = cSum / w
@@ -351,28 +352,32 @@ function detectStackedCartBoxes(imageData, sensitivity = 55) {
   let topY = -1
   let botY = -1
   for (let y = 0; y < h; y += 1) {
-    if (rowChroma[y] > 26) {
+    if (rowChroma[y] > 24) {
       if (topY === -1) topY = y
       botY = y
     }
   }
 
+  const roiH = botY - topY + 1
+  if (topY === -1 || roiH < 60) return []
+
+  // 바닥 반사광 등을 배제하기 위해 ROI 높이의 28% 이상 유채색을 띠는 x범위만 전경으로 채택
   let leftX = -1
   let rightX = -1
   for (let x = 0; x < w; x += 1) {
-    if (colChroma[x] / h > 11) {
+    if (colChromaCount[x] >= roiH * 0.28) {
       if (leftX === -1) leftX = x
       rightX = x
     }
   }
 
-  if (topY === -1 || leftX === -1 || botY - topY < 80 || rightX - leftX < 80) {
+  if (leftX === -1 || rightX - leftX < 80) {
     return []
   }
 
-  // 앞면 적재부(40% ~ 92%)에서 수직 열 경계 틈새 탐색
-  const sampleY1 = Math.round(topY + (botY - topY) * 0.4)
-  const sampleY2 = Math.round(topY + (botY - topY) * 0.92)
+  // 앞면 적재부(42% ~ 92%)에서 수직 열 경계 틈새 탐색
+  const sampleY1 = Math.round(topY + roiH * 0.42)
+  const sampleY2 = Math.round(topY + roiH * 0.92)
   const sampleH = Math.max(1, sampleY2 - sampleY1 + 1)
   const colLuma = new Float32Array(w)
   for (let x = leftX; x <= rightX; x += 1) {
@@ -403,7 +408,7 @@ function detectStackedCartBoxes(imageData, sensitivity = 55) {
     }
     if (!lc || !rc) continue
     const vDepth = Math.min(leftM / lc - colLuma[x], rightM / rc - colLuma[x])
-    if (vDepth > 5.5) {
+    if (vDepth > 2.2) {
       vValleys.push({ x, depth: vDepth })
     }
   }
@@ -420,7 +425,12 @@ function detectStackedCartBoxes(imageData, sensitivity = 55) {
   const splits = [leftX, ...chosenSplits, rightX]
 
   const boxes = []
+  // 가로 사진/세로 사진 크기에 비례하여 최소 층간 거리를 동적 산출
+  const minLayerGap = Math.max(22, Math.round(roiH * 0.045))
+  const winMin = Math.max(3, Math.round(minLayerGap * 0.12))
+  const winMax = Math.max(8, Math.round(minLayerGap * 0.35))
   const valleyThresh = Math.max(1.8, 4.8 - (sensitivity / 100) * 4.0)
+  const topMargin = Math.max(24, Math.round(roiH * 0.12))
 
   for (let c = 0; c < splits.length - 1; c += 1) {
     const cx1 = splits[c] + 4
@@ -428,7 +438,6 @@ function detectStackedCartBoxes(imageData, sensitivity = 55) {
     const colW = cx2 - cx1
     if (colW < 60) continue
 
-    // 기울기 영향을 최소화하기 위해 열 중앙 31px 좁은 세로 띠에서 밝기 프로파일 추출
     const midX = Math.round((cx1 + cx2) / 2)
     const hs = Math.min(15, Math.round(colW * 0.2))
     const sx1 = midX - hs
@@ -445,18 +454,18 @@ function detectStackedCartBoxes(imageData, sensitivity = 55) {
     }
 
     const hValleys = []
-    for (let y = topY + 25; y <= botY - 18; y += 1) {
+    for (let y = topY + topMargin; y <= botY - Math.round(minLayerGap * 0.35); y += 1) {
       let aboveSum = 0
       let ac = 0
       let belowSum = 0
       let bc = 0
-      for (let dy = -16; dy <= -4; dy += 1) {
+      for (let dy = -winMax; dy <= -winMin; dy += 1) {
         if (y + dy >= topY) {
           aboveSum += rowLuma[y + dy]
           ac += 1
         }
       }
-      for (let dy = 4; dy <= 16; dy += 1) {
+      for (let dy = winMin; dy <= winMax; dy += 1) {
         if (y + dy <= botY) {
           belowSum += rowLuma[y + dy]
           bc += 1
@@ -473,7 +482,7 @@ function detectStackedCartBoxes(imageData, sensitivity = 55) {
     const chosenY = []
     for (let i = 0; i < hValleys.length; i += 1) {
       const v = hValleys[i]
-      if (chosenY.every((cy) => Math.abs(cy - v.y) >= 48)) {
+      if (chosenY.every((cy) => Math.abs(cy - v.y) >= minLayerGap)) {
         chosenY.push(v.y)
       }
     }
@@ -486,7 +495,7 @@ function detectStackedCartBoxes(imageData, sensitivity = 55) {
         const y1 = yBounds[r]
         const y2 = yBounds[r + 1]
         const bh = y2 - y1
-        if (bh >= 25 && colW / bh >= 1.1) {
+        if (bh >= Math.round(minLayerGap * 0.55) && colW / bh >= 1.1) {
           boxes.push({
             x: cx1,
             y: y1,
@@ -517,7 +526,8 @@ function finalizeAndSortCircles(rawCircles, w, h, minR) {
     for (let j = 0; j < accepted.length; j += 1) {
       const k = accepted[j]
       const dist = Math.hypot(c.x - k.x, c.y - k.y)
-      if (dist < Math.min(c.r, k.r) * 1.48) {
+      // 한 바이알 캡 위에 2개의 마커가 겹쳐 찍히지 않도록 엄격히 중복 제거
+      if (dist < (c.r + k.r) * 0.84) {
         overlaps = true
         break
       }
@@ -527,16 +537,33 @@ function finalizeAndSortCircles(rawCircles, w, h, minR) {
     }
   }
 
-  if (accepted.length === 0) return []
+  // 군집 필터: 본체(6개 이상)가 존재할 때 발바닥·트레이 모서리 등 고립된 오탐(이웃 2개 미만) 제거
+  const clustered =
+    accepted.length >= 6
+      ? accepted.filter((c, idx) => {
+          let neighbors = 0
+          const maxDist = Math.max(40, c.r * 3.8)
+          for (let j = 0; j < accepted.length; j += 1) {
+            if (idx === j) continue
+            if (Math.hypot(c.x - accepted[j].x, c.y - accepted[j].y) <= maxDist) {
+              neighbors += 1
+              if (neighbors >= 2) return true
+            }
+          }
+          return false
+        })
+      : accepted
 
-  const radii = accepted.map((c) => c.r).sort((a, b) => a - b)
+  if (clustered.length === 0) return []
+
+  const radii = clustered.map((c) => c.r).sort((a, b) => a - b)
   const medianR = radii[(radii.length / 2) | 0] || minR
   const rowTolerance = medianR * 1.2
 
-  accepted.sort((a, b) => a.y - b.y)
+  clustered.sort((a, b) => a.y - b.y)
   const rows = []
-  for (let i = 0; i < accepted.length; i += 1) {
-    const c = accepted[i]
+  for (let i = 0; i < clustered.length; i += 1) {
+    const c = clustered[i]
     const lastRow = rows[rows.length - 1]
     if (!lastRow || Math.abs(c.y - lastRow.anchorY) > rowTolerance) {
       rows.push({ anchorY: c.y, items: [c] })
