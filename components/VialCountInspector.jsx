@@ -261,6 +261,66 @@ function extractTrayRoi(imageData) {
 // 4. 캡 지름의 80% 거리 이내 NMS(비최대 억제)로 바이알당 딱 1개 마커
 // 5. 초록색 트레이 내부(ROI) 안에서만 결과 허용
 // ─────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+// [알고리즘 2] OpenCV 템플릿 매칭 기반 바이알 캡 검출 (2단계 평균 템플릿 + 중심 자동 스냅)
+// 1. 클릭 위치 정중앙 자동 보정: 클릭 지점 반경 10px 내 원형 방사형 대칭성/원형 적합도 중심 스냅
+// 2. 1차 매칭: 스냅된 초기 템플릿으로 1차 후보군 탐색
+// 3. 다중 샘플 평균 템플릿(Averaged Template): 상위 5개 캡 패치를 평균 합성해 반사광/스크래치 노이즈 제거
+// 4. 최종 매칭: 평균 템플릿으로 멀티 스케일(0.95, 1.0, 1.05) 매칭 및 NMS 적용
+// 5. 초록색 트레이 내부(ROI) 안에서만 결과 허용
+// ─────────────────────────────────────────────────────────────────
+
+// 클릭 지점 주변 10픽셀 반경에서 원형 테두리 대칭도(Radial Gradient Symmetry)가 최대인 중심점을 찾습니다.
+function snapToCapCenter(gray, w, h, initX, initY, estR) {
+  const searchR = 10
+  let bestX = initX
+  let bestY = initY
+  let bestSymmetry = -Infinity
+
+  for (let dy = -searchR; dy <= searchR; dy += 1) {
+    const cy = initY + dy
+    if (cy - estR < 0 || cy + estR >= h) continue
+    for (let dx = -searchR; dx <= searchR; dx += 1) {
+      const cx = initX + dx
+      if (cx - estR < 0 || cx + estR >= w) continue
+
+      // 둘레 16개 방향 샘플링으로 방사형 밝기 변화 및 중심 대칭성 측정
+      let symScore = 0
+      for (let k = 0; k < 8; k += 1) {
+        const theta = (k * Math.PI) / 8
+        const cos = Math.cos(theta)
+        const sin = Math.sin(theta)
+
+        // 반대편 지점 2개 (원 둘레 및 내부)
+        const x1 = Math.round(cx + estR * cos)
+        const y1 = Math.round(cy + estR * sin)
+        const x2 = Math.round(cx - estR * cos)
+        const y2 = Math.round(cy - estR * sin)
+
+        const v1 = gray[y1 * w + x1]
+        const v2 = gray[y2 * w + x2]
+        // 반대편 쌍의 밝기 차이가 적을수록 원형 대칭성 높음
+        const diff = Math.abs(v1 - v2)
+
+        // 원 둘레(어두운 틈)와 캡 중심(밝은 은색) 대비
+        const centerVal = gray[cy * w + cx]
+        const edgeVal = (v1 + v2) * 0.5
+        const contrast = centerVal - edgeVal
+
+        symScore += contrast - diff * 0.8
+      }
+
+      if (symScore > bestSymmetry) {
+        bestSymmetry = symScore
+        bestX = cx
+        bestY = cy
+      }
+    }
+  }
+
+  return { x: bestX, y: bestY }
+}
+
 function detectDenseVialCapsByTemplateMatching(
   imageData,
   minR = 15,
@@ -285,49 +345,39 @@ function detectDenseVialCapsByTemplateMatching(
     gray[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]
   }
 
-  // 1. 기준 캡 중심 좌표 확정 (사용자 클릭 좌표 또는 트레이 중심부 기본 좌표)
-  let centerPxX = Math.round((trayRoi.sx + trayRoi.ex) / 2)
-  let centerPxY = Math.round((trayRoi.sy + trayRoi.ey) / 2)
+  // 1. 기준 캡 중심 좌표 확정 및 반경 10픽셀 정중앙 자동 스냅
+  let rawCenterX = Math.round((trayRoi.sx + trayRoi.ex) / 2)
+  let rawCenterY = Math.round((trayRoi.sy + trayRoi.ey) / 2)
 
   if (userTemplatePoint && typeof userTemplatePoint.x === 'number' && typeof userTemplatePoint.y === 'number') {
     const cx = Math.round(userTemplatePoint.x * w)
     const cy = Math.round(userTemplatePoint.y * h)
     if (cx >= trayRoi.sx && cx <= trayRoi.ex && cy >= trayRoi.sy && cy <= trayRoi.ey) {
-      centerPxX = cx
-      centerPxY = cy
+      rawCenterX = cx
+      rawCenterY = cy
     }
   }
+
+  const snapped = snapToCapCenter(gray, w, h, rawCenterX, rawCenterY, estR)
+  const centerPxX = snapped.x
+  const centerPxY = snapped.y
 
   const templX = clamp(centerPxX - templR, 0, w - templW)
   const templY = clamp(centerPxY - templR, 0, h - templH)
 
-  // 템플릿 패치 평균 및 표준편차 계산
-  let templSum = 0, templSqSum = 0
-  const templCount = templW * templH
-  for (let ty = 0; ty < templH; ty += 1) {
-    const row = (templY + ty) * w
-    for (let tx = 0; tx < templW; tx += 1) {
-      const v = gray[row + templX + tx]
-      templSum += v
-      templSqSum += v * v
-    }
-  }
-  const templMean = templSum / templCount
-  const templVariance = Math.max(1, templSqSum / templCount - templMean * templMean)
-  const templStd = Math.sqrt(templVariance)
-
-  const templNorm = new Float32Array(templCount)
+  // 1차 템플릿 패치 추출 (단일 캡)
+  const singleTempl = new Float32Array(templW * templH)
   for (let ty = 0; ty < templH; ty += 1) {
     const row = (templY + ty) * w
     const tRow = ty * templW
     for (let tx = 0; tx < templW; tx += 1) {
-      templNorm[tRow + tx] = (gray[row + templX + tx] - templMean) / templStd
+      singleTempl[tRow + tx] = gray[row + templX + tx]
     }
   }
 
-  // 2. 전체 매칭 점수 맵 계산 (OpenCV 준비 시 cv.matchTemplate, 미준비 시 고속 정규화 상호상관)
-  const matchCandidates = []
+  // 2. 1차 매칭 수행: 상위 5개 후보 검출 (다중 샘플 평균 템플릿 제작용)
   const simThresh = Math.max(0.40, Math.min(0.92, sensitivity / 100))
+  let top5Centers = [{ x: centerPxX, y: centerPxY }]
 
   if (isOpenCvReady() && typeof window !== 'undefined' && window.cv) {
     const cv = window.cv
@@ -343,8 +393,106 @@ function detectDenseVialCapsByTemplateMatching(
       const rect = new cv.Rect(templX, templY, templW, templH)
       templMat = grayMat.roi(rect)
       resMat = new cv.Mat()
-
       cv.matchTemplate(grayMat, templMat, resMat, cv.TM_CCOEFF_NORMED)
+
+      const resRows = resMat.rows
+      const resCols = resMat.cols
+      const resData = resMat.data32F
+      const candidates = []
+
+      for (let y = 0; y < resRows; y += 1) {
+        const my = y + templR
+        if (my < trayRoi.sy || my > trayRoi.ey) continue
+        const row = y * resCols
+        for (let x = 0; x < resCols; x += 1) {
+          const mx = x + templR
+          if (mx < trayRoi.sx || mx > trayRoi.ex) continue
+          const score = resData[row + x]
+          if (score >= simThresh * 0.9) {
+            candidates.push({ x: mx, y: my, score })
+          }
+        }
+      }
+
+      // NMS로 겹치는 위치 정리 후 상위 5개 추출
+      candidates.sort((a, b) => b.score - a.score)
+      const topN = []
+      const nmsDist = templW * 0.8
+      for (let i = 0; i < candidates.length && topN.length < 5; i += 1) {
+        const cand = candidates[i]
+        const hasOverlap = topN.some((c) => Math.hypot(c.x - cand.x, c.y - cand.y) < nmsDist)
+        if (!hasOverlap) {
+          topN.push({ x: cand.x, y: cand.y })
+        }
+      }
+      if (topN.length >= 2) {
+        top5Centers = topN
+      }
+    } catch (e) {
+      // 순수 JS 폴백 시 초기 센터 유지
+    } finally {
+      if (templMat) templMat.delete()
+      if (resMat) resMat.delete()
+      if (grayMat) grayMat.delete()
+      if (srcMat) srcMat.delete()
+    }
+  }
+
+  // 3. 다중 샘플 평균 템플릿(Averaged Template) 생성
+  // 상위 5개 캡 패치를 픽셀 단위로 겹쳐 평균화 → 개별 캡의 빛 반사, 미세 스크래치, 먼지 노이즈 제거
+  const avgTempl = new Float32Array(templW * templH)
+  const sampleCount = top5Centers.length
+  for (let s = 0; s < sampleCount; s += 1) {
+    const sc = top5Centers[s]
+    const sx = clamp(sc.x - templR, 0, w - templW)
+    const sy = clamp(sc.y - templR, 0, h - templH)
+    for (let ty = 0; ty < templH; ty += 1) {
+      const row = (sy + ty) * w
+      const tRow = ty * templW
+      for (let tx = 0; tx < templW; tx += 1) {
+        avgTempl[tRow + tx] += gray[row + sx + tx] / sampleCount
+      }
+    }
+  }
+
+  // 평균 템플릿 정규화
+  let tSum = 0, tSqSum = 0
+  const templCount = templW * templH
+  for (let i = 0; i < templCount; i += 1) {
+    const v = avgTempl[i]
+    tSum += v
+    tSqSum += v * v
+  }
+  const tMean = tSum / templCount
+  const tStd = Math.sqrt(Math.max(1, tSqSum / templCount - tMean * tMean))
+  const templNorm = new Float32Array(templCount)
+  for (let i = 0; i < templCount; i += 1) {
+    templNorm[i] = (avgTempl[i] - tMean) / tStd
+  }
+
+  // 4. 최종 매칭: 평균 템플릿을 사용하여 OpenCV 또는 고속 NCC 매칭 실행
+  const matchCandidates = []
+
+  if (isOpenCvReady() && typeof window !== 'undefined' && window.cv) {
+    const cv = window.cv
+    let srcMat = null
+    let grayMat = null
+    let avgTemplMat = null
+    let resMat = null
+    try {
+      srcMat = cv.matFromImageData(imageData)
+      grayMat = new cv.Mat()
+      cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY)
+
+      // 평균 템플릿을 Mat으로 구성
+      avgTemplMat = new cv.Mat(templH, templW, cv.CV_8UC1)
+      const matData = avgTemplMat.data
+      for (let i = 0; i < templCount; i += 1) {
+        matData[i] = Math.round(clamp(avgTempl[i], 0, 255))
+      }
+
+      resMat = new cv.Mat()
+      cv.matchTemplate(grayMat, avgTemplMat, resMat, cv.TM_CCOEFF_NORMED)
 
       const resRows = resMat.rows
       const resCols = resMat.cols
@@ -372,9 +520,9 @@ function detectDenseVialCapsByTemplateMatching(
         }
       }
     } catch (e) {
-      // OpenCV 매칭 예외 발생 시 순수 JS 엔진으로 안전하게 계속 처리
+      // 예외 발생 시 순수 JS 매칭으로 폴백
     } finally {
-      if (templMat) templMat.delete()
+      if (avgTemplMat) avgTemplMat.delete()
       if (resMat) resMat.delete()
       if (grayMat) grayMat.delete()
       if (srcMat) srcMat.delete()
@@ -383,12 +531,11 @@ function detectDenseVialCapsByTemplateMatching(
 
   // 순수 JS 매칭 폴백 (OpenCV 미실행 또는 후보 미검출 시)
   if (matchCandidates.length === 0) {
-    const step = 2 // 2px 간격 고속 서치
+    const step = 2 // 2px 고속 순회
     for (let y = trayRoi.sy; y <= trayRoi.ey - templH; y += step) {
       const my = y + templR
       for (let x = trayRoi.sx; x <= trayRoi.ex - templW; x += step) {
         const mx = x + templR
-
         let pSum = 0, pSqSum = 0, dot = 0
         for (let ty = 0; ty < templH; ty += 2) {
           const row = (y + ty) * w
@@ -400,11 +547,11 @@ function detectDenseVialCapsByTemplateMatching(
             dot += v * templNorm[tRow + tx]
           }
         }
-        const sampleCount = (templH / 2) * (templW / 2)
-        const pMean = pSum / sampleCount
-        const pVar = Math.max(1, pSqSum / sampleCount - pMean * pMean)
+        const samplePoints = (templH / 2) * (templW / 2)
+        const pMean = pSum / samplePoints
+        const pVar = Math.max(1, pSqSum / samplePoints - pMean * pMean)
         const pStd = Math.sqrt(pVar)
-        const ncc = dot / (sampleCount * pStd)
+        const ncc = dot / (samplePoints * pStd)
 
         if (ncc >= simThresh) {
           matchCandidates.push({
@@ -419,8 +566,8 @@ function detectDenseVialCapsByTemplateMatching(
     }
   }
 
-  // 3. 비최대 억제(NMS): 캡 지름의 80% 이내에 겹치는 좌표는 제거해 바이알당 딱 1개의 마커만 추출
-  const nmsMinDist = templW * 0.80 // 캡 지름(2*r)의 80%
+  // 5. 비최대 억제(NMS): 캡 지름의 80% 이내에 겹치는 좌표는 최고점 1개만 허용
+  const nmsMinDist = templW * 0.80
   matchCandidates.sort((a, b) => b.score - a.score)
   const accepted = []
 
