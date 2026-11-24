@@ -50,9 +50,9 @@ export function isOpenCvReady() {
   const cv = window.cv
   return Boolean(
     cv &&
-      typeof cv.Mat === 'function' &&
-      typeof cv.cvtColor === 'function' &&
-      typeof cv.HoughCircles === 'function'
+    typeof cv.Mat === 'function' &&
+    typeof cv.cvtColor === 'function' &&
+    typeof cv.HoughCircles === 'function'
   )
 }
 
@@ -210,351 +210,17 @@ function resolveNestedCircles(rawCircles) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// [알고리즘 보조] 1. 순수 JS 고속 CLAHE (Contrast Limited Adaptive Histogram Equalization)
-// 바이알 캡과 캡 사이의 미세한 둥근 그림자 경계선(어두운 틈새)을 극도로 선명하게 부각시킵니다.
+// [알고리즘 1] 초록색 트레이 내부 ROI 추출
+// 상단 은색 레일, 바닥 반사광, 트레이 벽 바깥의 오인식을 100% 원천 차단합니다.
 // ─────────────────────────────────────────────────────────────────
-function applyCLAHE(gray, w, h, tilesX = 8, tilesY = 8, clipLimit = 3.0, isGreen = null) {
-  const n = w * h
-  const output = new Float32Array(n)
-  const tileW = Math.ceil(w / tilesX)
-  const tileH = Math.ceil(h / tilesY)
-  const numBins = 256
-
-  // 1. 각 타일별 히스토그램 생성 및 클리핑(재분배)
-  const cdfTables = new Float32Array(tilesX * tilesY * numBins)
-
-  for (let ty = 0; ty < tilesY; ty += 1) {
-    const y0 = ty * tileH
-    const y1 = Math.min(h, (ty + 1) * tileH)
-    for (let tx = 0; tx < tilesX; tx += 1) {
-      const x0 = tx * tileW
-      const x1 = Math.min(w, (tx + 1) * tileW)
-      const hist = new Int32Array(numBins)
-      let count = 0
-
-      for (let y = y0; y < y1; y += 1) {
-        const row = y * w
-        for (let x = x0; x < x1; x += 1) {
-          const idx = row + x
-          if (isGreen && isGreen[idx]) continue
-          const v = Math.max(0, Math.min(255, Math.round(gray[idx])))
-          hist[v] += 1
-          count += 1
-        }
-      }
-
-      const tableOffset = (ty * tilesX + tx) * numBins
-      if (count === 0) {
-        for (let i = 0; i < numBins; i += 1) cdfTables[tableOffset + i] = i
-        continue
-      }
-
-      // Clip limit 적용
-      const clipVal = Math.max(1, Math.round((clipLimit * count) / numBins))
-      let clippedSum = 0
-      for (let i = 0; i < numBins; i += 1) {
-        if (hist[i] > clipVal) {
-          clippedSum += hist[i] - clipVal
-          hist[i] = clipVal
-        }
-      }
-      const redistVal = Math.floor(clippedSum / numBins)
-      const remain = clippedSum - redistVal * numBins
-      for (let i = 0; i < numBins; i += 1) {
-        hist[i] += redistVal + (i < remain ? 1 : 0)
-      }
-
-      // CDF 계산
-      let cdf = 0
-      for (let i = 0; i < numBins; i += 1) {
-        cdf += hist[i]
-        cdfTables[tableOffset + i] = (cdf / count) * 255
-      }
-    }
-  }
-
-  // 2. 쌍선형 보간(Bilinear Interpolation)으로 경계 격자 없이 부드럽게 매핑
-  for (let y = 0; y < h; y += 1) {
-    const row = y * w
-    const tyFloat = (y - tileH / 2) / tileH
-    const ty1 = Math.max(0, Math.min(tilesY - 1, Math.floor(tyFloat)))
-    const ty2 = Math.max(0, Math.min(tilesY - 1, ty1 + 1))
-    const dy = Math.max(0, Math.min(1, tyFloat - ty1))
-
-    for (let x = 0; x < w; x += 1) {
-      const idx = row + x
-      if (isGreen && isGreen[idx]) {
-        output[idx] = 0
-        continue
-      }
-      const v = Math.max(0, Math.min(255, Math.round(gray[idx])))
-      const txFloat = (x - tileW / 2) / tileW
-      const tx1 = Math.max(0, Math.min(tilesX - 1, Math.floor(txFloat)))
-      const tx2 = Math.max(0, Math.min(tilesX - 1, tx1 + 1))
-      const dx = Math.max(0, Math.min(1, txFloat - tx1))
-
-      const c00 = cdfTables[(ty1 * tilesX + tx1) * numBins + v]
-      const c10 = cdfTables[(ty1 * tilesX + tx2) * numBins + v]
-      const c01 = cdfTables[(ty2 * tilesX + tx1) * numBins + v]
-      const c11 = cdfTables[(ty2 * tilesX + tx2) * numBins + v]
-
-      const top = c00 * (1 - dx) + c10 * dx
-      const bottom = c01 * (1 - dx) + c11 * dx
-      output[idx] = top * (1 - dy) + bottom * dy
-    }
-  }
-
-  return output
-}
-
-// ─────────────────────────────────────────────────────────────────
-// [알고리즘 보조] 2. 적분 영상 기반 초고속 적응형 이진화 (Adaptive Threshold)
-// 캡 표면은 흰색(255), 캡 사이의 미세한 그림자 경계선은 검정(0)으로 확실하게 분리합니다.
-// ─────────────────────────────────────────────────────────────────
-function applyAdaptiveThreshold(src, w, h, blockSize, C, isGreen, sx, ex, sy, ey) {
-  const n = w * h
-  const binary = new Uint8Array(n)
-  const integral = new Float64Array((w + 1) * (h + 1))
-
-  // 1. 적분 영상(Integral Image) 계산
-  for (let y = 0; y < h; y += 1) {
-    let rowSum = 0
-    const srcRow = y * w
-    const intRow1 = y * (w + 1)
-    const intRow2 = (y + 1) * (w + 1)
-    for (let x = 0; x < w; x += 1) {
-      rowSum += src[srcRow + x]
-      integral[intRow2 + x + 1] = integral[intRow1 + x + 1] + rowSum
-    }
-  }
-
-  const half = Math.floor(blockSize / 2)
-
-  // 2. 적응형 임계값 비교
-  for (let y = sy; y < ey; y += 1) {
-    const row = y * w
-    const y0 = Math.max(0, y - half)
-    const y1 = Math.min(h, y + half + 1)
-    const intRowY0 = y0 * (w + 1)
-    const intRowY1 = y1 * (w + 1)
-
-    for (let x = sx; x < ex; x += 1) {
-      const idx = row + x
-      if (isGreen && isGreen[idx]) continue
-
-      const x0 = Math.max(0, x - half)
-      const x1 = Math.min(w, x + half + 1)
-      const count = (x1 - x0) * (y1 - y0)
-      const sum = integral[intRowY1 + x1] - integral[intRowY0 + x1] - integral[intRowY1 + x0] + integral[intRowY0 + x0]
-      const mean = sum / count
-
-      // 픽셀이 국소 평균 - C 이상이면 캡 표면(255), 아니면 테두리 그림자(0)
-      if (src[idx] >= mean - C && src[idx] > 40) {
-        binary[idx] = 255
-      }
-    }
-  }
-
-  return binary
-}
-
-// ─────────────────────────────────────────────────────────────────
-// [알고리즘 보조] 3. MORPH_CLOSE (캡 정중앙의 작은 검은 점만 메우기)
-// ─────────────────────────────────────────────────────────────────
-function applyMorphClose(binary, w, h, kSize, sx, ex, sy, ey) {
-  const n = w * h
-  const half = Math.floor(kSize / 2)
-  const dilated = new Uint8Array(n)
-  const closed = new Uint8Array(n)
-
-  // 팽창 (Dilate)
-  for (let y = sy; y < ey; y += 1) {
-    const row = y * w
-    for (let x = sx; x < ex; x += 1) {
-      let found = false
-      for (let dy = -half; dy <= half && !found; dy += 1) {
-        const ny = y + dy
-        if (ny < sy || ny >= ey) continue
-        const nRow = ny * w
-        for (let dx = -half; dx <= half; dx += 1) {
-          const nx = x + dx
-          if (nx >= sx && nx < ex && binary[nRow + nx]) {
-            found = true
-            break
-          }
-        }
-      }
-      if (found) dilated[row + x] = 255
-    }
-  }
-
-  // 침식 (Erode)
-  for (let y = sy; y < ey; y += 1) {
-    const row = y * w
-    for (let x = sx; x < ex; x += 1) {
-      let allOnes = true
-      for (let dy = -half; dy <= half && allOnes; dy += 1) {
-        const ny = y + dy
-        if (ny < sy || ny >= ey) continue
-        const nRow = ny * w
-        for (let dx = -half; dx <= half; dx += 1) {
-          const nx = x + dx
-          if (nx < sx || nx >= ex || !dilated[nRow + nx]) {
-            allOnes = false
-            break
-          }
-        }
-      }
-      if (allOnes) closed[row + x] = 255
-    }
-  }
-
-  return closed
-}
-
-// ─────────────────────────────────────────────────────────────────
-// [알고리즘 보조] 4. cv.erode (침식 1~2회: 붙어있는 캡 경계선 분리)
-// ─────────────────────────────────────────────────────────────────
-function applyErosion(binary, w, h, kSize, iterations, sx, ex, sy, ey) {
-  let current = binary
-  const half = Math.floor(kSize / 2)
-
-  for (let it = 0; it < iterations; it += 1) {
-    const next = new Uint8Array(w * h)
-    for (let y = sy; y < ey; y += 1) {
-      const row = y * w
-      for (let x = sx; x < ex; x += 1) {
-        if (!current[row + x]) continue
-        let keep = true
-        for (let dy = -half; dy <= half && keep; dy += 1) {
-          const ny = y + dy
-          if (ny < sy || ny >= ey) { keep = false; break }
-          const nRow = ny * w
-          for (let dx = -half; dx <= half; dx += 1) {
-            const nx = x + dx
-            if (nx < sx || nx >= ex || !current[nRow + nx]) {
-              keep = false
-              break
-            }
-          }
-        }
-        if (keep) next[row + x] = 255
-      }
-    }
-    current = next
-  }
-
-  return current
-}
-
-// ─────────────────────────────────────────────────────────────────
-// [알고리즘 보조] 5. cv.distanceTransform & 지름 약 75% 최소 거리 피크 추출
-// ─────────────────────────────────────────────────────────────────
-function extractDistanceTransformPeaks(eroded, w, h, minDist, estR, sx, ex, sy, ey) {
-  const n = w * h
-  const dist = new Float32Array(n)
-
-  // 2-Pass 거리 변환 (맨해튼 + 체스판 근사: 고속 & 정밀)
-  for (let y = sy; y < ey; y += 1) {
-    const row = y * w
-    for (let x = sx; x < ex; x += 1) {
-      const idx = row + x
-      if (!eroded[idx]) {
-        dist[idx] = 0
-        continue
-      }
-      const top = y > sy ? dist[(y - 1) * w + x] + 1 : Infinity
-      const left = x > sx ? dist[idx - 1] + 1 : Infinity
-      dist[idx] = Math.min(top, left, 255)
-    }
-  }
-
-  for (let y = ey - 1; y >= sy; y -= 1) {
-    const row = y * w
-    for (let x = ex - 1; x >= sx; x -= 1) {
-      const idx = row + x
-      if (!eroded[idx]) continue
-      const bottom = y < ey - 1 ? dist[(y + 1) * w + x] + 1 : Infinity
-      const right = x < ex - 1 ? dist[idx + 1] + 1 : Infinity
-      dist[idx] = Math.min(dist[idx], bottom, right)
-    }
-  }
-
-  // 로컬 최댓값(피크) 탐색
-  const checkR = Math.max(3, Math.round(minR_internal(estR) * 0.45))
-  const rawPeaks = []
-
-  for (let y = sy + checkR; y < ey - checkR; y += 1) {
-    const row = y * w
-    for (let x = sx + checkR; x < ex - checkR; x += 1) {
-      const val = dist[row + x]
-      if (val < 2.5) continue // 너무 작은 잔여 노이즈 배제
-
-      let isMax = true
-      for (let dy = -checkR; dy <= checkR && isMax; dy += 1) {
-        const nRow = (y + dy) * w
-        for (let dx = -checkR; dx <= checkR; dx += 1) {
-          if (dx === 0 && dy === 0) continue
-          if (dist[nRow + x + dx] > val) {
-            isMax = false
-            break
-          }
-        }
-      }
-
-      if (isMax) {
-        rawPeaks.push({ x, y, dist: val, r: estR, score: val, confidence: 0.95 })
-      }
-    }
-  }
-
-  // 지름의 약 75% 최소 거리(minDist) 비최대 억제(NMS)
-  rawPeaks.sort((a, b) => b.dist - a.dist)
-  const accepted = []
-
-  for (let i = 0; i < rawPeaks.length; i += 1) {
-    const pk = rawPeaks[i]
-    let overlaps = false
-    for (let j = 0; j < accepted.length; j += 1) {
-      const ac = accepted[j]
-      if (Math.hypot(pk.x - ac.x, pk.y - ac.y) < minDist) {
-        overlaps = true
-        break
-      }
-    }
-    if (!overlaps) {
-      accepted.push(pk)
-    }
-  }
-
-  return { dist, peaks: accepted }
-}
-
-function minR_internal(estR) {
-  return Math.max(10, estR)
-}
-
-// ─────────────────────────────────────────────────────────────────
-// 바이알 캡 모드 종합 파이프라인 (검출 & 전처리 미리보기 공통)
-// ─────────────────────────────────────────────────────────────────
-function processDenseVialCapsPipeline(imageData, minR = 15, maxR = 48, sensitivity = 55) {
+function extractTrayRoi(imageData) {
   const { width: w, height: h, data } = imageData
-  if (!w || !h || !data || w < 100 || h < 100) {
-    return { candidates: [], previewData: null }
-  }
-
   const n = w * h
-  const gray = new Float32Array(n)
-  const isGreen = new Uint8Array(n)
-
   let trayMinX = w, trayMaxX = 0, trayMinY = h, trayMaxY = 0, trayCount = 0
 
-  // 1. 초록색 배경 제거 (HSV 필터)
   for (let i = 0; i < n; i += 1) {
     const p = i * 4
     const r = data[p], g = data[p + 1], b = data[p + 2]
-    gray[i] = 0.299 * r + 0.587 * g + 0.114 * b
-
     const maxC = Math.max(r, g, b), minC = Math.min(r, g, b), diff = maxC - minC
     if (diff > 0 && maxC > 35) {
       let hue = 0
@@ -564,7 +230,6 @@ function processDenseVialCapsPipeline(imageData, minR = 15, maxR = 48, sensitivi
 
       const sat = diff / maxC
       if (hue >= 65 && hue <= 175 && sat >= 0.18) {
-        isGreen[i] = 1
         const x = i % w, y = (i / w) | 0
         if (x < trayMinX) trayMinX = x
         if (x > trayMaxX) trayMaxX = x
@@ -576,303 +241,494 @@ function processDenseVialCapsPipeline(imageData, minR = 15, maxR = 48, sensitivi
   }
 
   const hasTray = trayCount > n * 0.05
-  let sx = 10, ex = w - 10, sy = 10, ey = h - 10
-  if (hasTray) {
-    sx = Math.max(0, trayMinX + 40)
-    ex = Math.min(w, trayMaxX - 40)
-    sy = Math.max(0, trayMinY + 60)
-    ey = Math.min(h, trayMaxY - 15)
+  if (!hasTray) {
+    return { sx: 20, ex: w - 20, sy: 20, ey: h - 20, hasTray: false }
   }
+  return {
+    sx: Math.max(10, trayMinX + 40),
+    ex: Math.min(w - 10, trayMaxX - 40),
+    sy: Math.max(10, trayMinY + 110), // 상단 은색 레일 오인식을 완벽히 차단!
+    ey: Math.min(h - 10, trayMaxY - 20),
+    hasTray: true,
+  }
+}
 
-  // 2. 캡 테두리 경계선 살리기:
-  //    (1) CLAHE 적용으로 캡 사이의 미세한 둥근 그림자 경계선 부각
-  const claheGray = applyCLAHE(gray, w, h, 8, 8, 3.0, isGreen)
+// ─────────────────────────────────────────────────────────────────
+// [알고리즘 2] OpenCV 템플릿 매칭(cv.matchTemplate) 기반 바이알 캡 검출
+// 1. 기준 캡 1개 템플릿 추출 (초기 정중앙 근처 자동 1개 또는 사용자 클릭 1개)
+// 2. cv.matchTemplate(TM_CCOEFF_NORMED) 전체 매칭
+// 3. 민감도(기본값 0.65) 이상 좌표 필터링
+// 4. 캡 지름의 80% 거리 이내 NMS(비최대 억제)로 바이알당 딱 1개 마커
+// 5. 초록색 트레이 내부(ROI) 안에서만 결과 허용
+// ─────────────────────────────────────────────────────────────────
+function detectDenseVialCapsByTemplateMatching(
+  imageData,
+  minR = 15,
+  maxR = 48,
+  sensitivity = 65,
+  userTemplatePoint = null
+) {
+  const { width: w, height: h, data } = imageData
+  if (!w || !h || !data || w < 100 || h < 100) return []
 
-  //    (2) 적응형 이진화: 캡 표면=흰색(255), 캡 사이 얇은 경계선=검정(0)
   const estR = Math.max(12, Math.round((minR + maxR) * 0.52))
-  const blockSize = Math.max(15, Math.round(estR * 1.3)) | 1
-  const adaptiveC = Math.max(1, Math.round(7 - (sensitivity / 100) * 5))
-  const adaptiveBinary = applyAdaptiveThreshold(claheGray, w, h, blockSize, adaptiveC, isGreen, sx, ex, sy, ey)
+  const templR = estR
+  const templW = templR * 2
+  const templH = templR * 2
+  const trayRoi = extractTrayRoi(imageData)
 
-  // 3. 검은 점 유무 통일 및 캡 분리:
-  //    (1) morphologyEx(MORPH_CLOSE): 캡 중앙 작은 검은 점 메우기 (5x5)
-  const closed = applyMorphClose(adaptiveBinary, w, h, 5, sx, ex, sy, ey)
-
-  //    (2) cv.erode(침식): 미세하게 붙어 있는 캡 경계들을 완전히 떼어내기 (3x3 원형 침식 1~2회)
-  const erodeIterations = sensitivity > 70 ? 2 : 1
-  const eroded = applyErosion(closed, w, h, 3, erodeIterations, sx, ex, sy, ey)
-
-  // 4. 정중앙 피크 추출: 바이알 지름의 약 75%를 최소 거리로 지정
-  const vialDiameter = estR * 2
-  const minDist = vialDiameter * 0.75
-  const { peaks } = extractDistanceTransformPeaks(eroded, w, h, minDist, estR, sx, ex, sy, ey)
-
-  // 전처리 보기 화면용 이미지 생성 (개별 분리된 흰색 원반 + 중심점 시각화)
-  const previewOut = new Uint8ClampedArray(n * 4)
+  // 그레이스케일 변환
+  const n = w * h
+  const gray = new Float32Array(n)
   for (let i = 0; i < n; i += 1) {
-    const v = eroded[i]
-    previewOut[i * 4] = v
-    previewOut[i * 4 + 1] = v
-    previewOut[i * 4 + 2] = v
-    previewOut[i * 4 + 3] = 255
+    const p = i * 4
+    gray[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]
   }
 
-  // 중심점 피크 위치를 시각적으로 작게 강조
-  for (let i = 0; i < peaks.length; i += 1) {
-    const { x, y } = peaks[i]
-    for (let dy = -2; dy <= 2; dy += 1) {
-      for (let dx = -2; dx <= 2; dx += 1) {
-        if (dx * dx + dy * dy <= 5) {
-          const idx = (y + dy) * w + (x + dx)
-          if (idx >= 0 && idx < n) {
-            previewOut[idx * 4] = 0
-            previewOut[idx * 4 + 1] = 255 // 초록색 피크 마커
-            previewOut[idx * 4 + 2] = 120
-            previewOut[idx * 4 + 3] = 255
+  // 1. 기준 캡 중심 좌표 확정 (사용자 클릭 좌표 또는 트레이 중심부 기본 좌표)
+  let centerPxX = Math.round((trayRoi.sx + trayRoi.ex) / 2)
+  let centerPxY = Math.round((trayRoi.sy + trayRoi.ey) / 2)
+
+  if (userTemplatePoint && typeof userTemplatePoint.x === 'number' && typeof userTemplatePoint.y === 'number') {
+    const cx = Math.round(userTemplatePoint.x * w)
+    const cy = Math.round(userTemplatePoint.y * h)
+    if (cx >= trayRoi.sx && cx <= trayRoi.ex && cy >= trayRoi.sy && cy <= trayRoi.ey) {
+      centerPxX = cx
+      centerPxY = cy
+    }
+  }
+
+  const templX = clamp(centerPxX - templR, 0, w - templW)
+  const templY = clamp(centerPxY - templR, 0, h - templH)
+
+  // 템플릿 패치 평균 및 표준편차 계산
+  let templSum = 0, templSqSum = 0
+  const templCount = templW * templH
+  for (let ty = 0; ty < templH; ty += 1) {
+    const row = (templY + ty) * w
+    for (let tx = 0; tx < templW; tx += 1) {
+      const v = gray[row + templX + tx]
+      templSum += v
+      templSqSum += v * v
+    }
+  }
+  const templMean = templSum / templCount
+  const templVariance = Math.max(1, templSqSum / templCount - templMean * templMean)
+  const templStd = Math.sqrt(templVariance)
+
+  const templNorm = new Float32Array(templCount)
+  for (let ty = 0; ty < templH; ty += 1) {
+    const row = (templY + ty) * w
+    const tRow = ty * templW
+    for (let tx = 0; tx < templW; tx += 1) {
+      templNorm[tRow + tx] = (gray[row + templX + tx] - templMean) / templStd
+    }
+  }
+
+  // 2. 전체 매칭 점수 맵 계산 (OpenCV 준비 시 cv.matchTemplate, 미준비 시 고속 정규화 상호상관)
+  const matchCandidates = []
+  const simThresh = Math.max(0.40, Math.min(0.92, sensitivity / 100))
+
+  if (isOpenCvReady() && typeof window !== 'undefined' && window.cv) {
+    const cv = window.cv
+    let srcMat = null
+    let grayMat = null
+    let templMat = null
+    let resMat = null
+    try {
+      srcMat = cv.matFromImageData(imageData)
+      grayMat = new cv.Mat()
+      cv.cvtColor(srcMat, grayMat, cv.COLOR_RGBA2GRAY)
+
+      const rect = new cv.Rect(templX, templY, templW, templH)
+      templMat = grayMat.roi(rect)
+      resMat = new cv.Mat()
+
+      cv.matchTemplate(grayMat, templMat, resMat, cv.TM_CCOEFF_NORMED)
+
+      const resRows = resMat.rows
+      const resCols = resMat.cols
+      const resData = resMat.data32F
+
+      for (let y = 0; y < resRows; y += 1) {
+        const my = y + templR
+        if (my < trayRoi.sy || my > trayRoi.ey) continue
+        const row = y * resCols
+
+        for (let x = 0; x < resCols; x += 1) {
+          const mx = x + templR
+          if (mx < trayRoi.sx || mx > trayRoi.ex) continue
+
+          const score = resData[row + x]
+          if (score >= simThresh) {
+            matchCandidates.push({
+              x: mx,
+              y: my,
+              r: estR,
+              score,
+              confidence: Number(score.toFixed(2)),
+            })
           }
+        }
+      }
+    } catch (e) {
+      // OpenCV 매칭 예외 발생 시 순수 JS 엔진으로 안전하게 계속 처리
+    } finally {
+      if (templMat) templMat.delete()
+      if (resMat) resMat.delete()
+      if (grayMat) grayMat.delete()
+      if (srcMat) srcMat.delete()
+    }
+  }
+
+  // 순수 JS 매칭 폴백 (OpenCV 미실행 또는 후보 미검출 시)
+  if (matchCandidates.length === 0) {
+    const step = 2 // 2px 간격 고속 서치
+    for (let y = trayRoi.sy; y <= trayRoi.ey - templH; y += step) {
+      const my = y + templR
+      for (let x = trayRoi.sx; x <= trayRoi.ex - templW; x += step) {
+        const mx = x + templR
+
+        let pSum = 0, pSqSum = 0, dot = 0
+        for (let ty = 0; ty < templH; ty += 2) {
+          const row = (y + ty) * w
+          const tRow = ty * templW
+          for (let tx = 0; tx < templW; tx += 2) {
+            const v = gray[row + x + tx]
+            pSum += v
+            pSqSum += v * v
+            dot += v * templNorm[tRow + tx]
+          }
+        }
+        const sampleCount = (templH / 2) * (templW / 2)
+        const pMean = pSum / sampleCount
+        const pVar = Math.max(1, pSqSum / sampleCount - pMean * pMean)
+        const pStd = Math.sqrt(pVar)
+        const ncc = dot / (sampleCount * pStd)
+
+        if (ncc >= simThresh) {
+          matchCandidates.push({
+            x: mx,
+            y: my,
+            r: estR,
+            score: ncc,
+            confidence: Number(ncc.toFixed(2)),
+          })
         }
       }
     }
   }
 
-  return {
-    candidates: peaks,
-    previewData: { binaryData: previewOut, width: w, height: h },
+  // 3. 비최대 억제(NMS): 캡 지름의 80% 이내에 겹치는 좌표는 제거해 바이알당 딱 1개의 마커만 추출
+  const nmsMinDist = templW * 0.80 // 캡 지름(2*r)의 80%
+  matchCandidates.sort((a, b) => b.score - a.score)
+  const accepted = []
+
+  for (let i = 0; i < matchCandidates.length; i += 1) {
+    const cand = matchCandidates[i]
+    let overlaps = false
+    for (let j = 0; j < accepted.length; j += 1) {
+      const ac = accepted[j]
+      if (Math.hypot(cand.x - ac.x, cand.y - ac.y) < nmsMinDist) {
+        overlaps = true
+        break
+      }
+    }
+    if (!overlaps) {
+      accepted.push(cand)
+    }
   }
+
+  return finalizeAndSortCircles(accepted, w, h, estR)
 }
 
 // ─────────────────────────────────────────────────────────────────
-// 디버그용: 캡 모드 전처리 흑백 이미지 (체이스가 눈으로 확인하는 [전처리 보기])
+// [알고리즘 3] 박스 모드: '사용자가 드래그한 앞면 영역(ROI) 내 수평 경계선 검출'
+// 1. 기본값: 이미지 및 박스 번들의 하단 60% 영역 자동 선택 (윗면 뚜껑 제외)
+// 2. 사용자가 드래그한 사각형 영역 안에서만 좌우 2열 분리 및 층수(8단) 검출
 // ─────────────────────────────────────────────────────────────────
-export function buildCapDebugPreview(imageData, rawParams = DEFAULT_DETECTION_PARAMS) {
-  const minR = Number(rawParams?.minRadius ?? 15)
-  const maxR = Number(rawParams?.maxRadius ?? 48)
-  const sensitivity = Number(rawParams?.sensitivity ?? 55)
-  const result = processDenseVialCapsPipeline(imageData, minR, maxR, sensitivity)
-  return result.previewData
-}
-
-// ─────────────────────────────────────────────────────────────────
-// 바이알 캡 모드 검출 함수
-// ─────────────────────────────────────────────────────────────────
-function detectDenseVialCaps(imageData, minR, maxR, sensitivity) {
-  const result = processDenseVialCapsPipeline(imageData, minR, maxR, sensitivity)
-  return result.candidates
-}
-
-function detectDenseVialCores(imageData, minR, maxR, sensitivity) {
-  return detectDenseVialCaps(imageData, minR, maxR, sensitivity)
-}
-
-// ─────────────────────────────────────────────────────────────────
-// 카트 박스 모드 종합 파이프라인 (원본 흑백 명암 가로선 검출 + 윗면 뚜껑 제외)
-// ─────────────────────────────────────────────────────────────────
-function processStackedCartBoxesPipeline(imageData, sensitivity = 55) {
+function detectStackedCartBoxesWithRoi(imageData, boxRoi = null, sensitivity = 55) {
   const { width: w, height: h, data } = imageData
-  if (!w || !h || !data || w < 120 || h < 120) {
-    return { boxes: [], previewData: null }
-  }
+  if (!w || !h || !data || w < 100 || h < 100) return []
 
   const n = w * h
+  // 그레이스케일 변환
   const gray = new Float32Array(n)
-  const isGreenBox = new Uint8Array(n)
-
-  // 1. HSV 필터: 박스 전체 덩어리의 바깥 영역(좌측 열 영역, 우측 열 영역)을 찾는 용도로만 사용
   for (let i = 0; i < n; i += 1) {
     const p = i * 4
-    const r = data[p], g = data[p + 1], b = data[p + 2]
-    gray[i] = 0.299 * r + 0.587 * g + 0.114 * b
+    gray[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2]
+  }
 
-    const maxC = Math.max(r, g, b), minC = Math.min(r, g, b), diff = maxC - minC
-    if (diff > 0 && maxC > 40) {
-      let hue = 0
-      if (maxC === r) hue = ((g - b) / diff + (g < b ? 6 : 0)) * 60
-      else if (maxC === g) hue = ((b - r) / diff + 2) * 60
-      else hue = ((r - g) / diff + 4) * 60
+  // ── 1. 앞면 ROI 영역 좌표 확정 ──────────────────────────────────
+  // 사용자가 드래그한 영역이 있으면 그 영역을 사용, 없으면 초록 박스 덩어리 자동 탐색 후 하단 60% 사용
+  let roiX1 = 0
+  let roiX2 = w
+  let roiY1 = Math.round(h * 0.35) // 기본: 상단 35% 뚜껑 제외
+  let roiY2 = Math.round(h * 0.97)
 
-      const sat = diff / maxC
-      if (hue >= 70 && hue <= 170 && sat >= 0.22) {
-        isGreenBox[i] = 1
+  if (boxRoi && typeof boxRoi.x === 'number' && typeof boxRoi.w === 'number') {
+    // 사용자가 직접 드래그한 영역
+    roiX1 = clamp(Math.round(boxRoi.x * w), 0, w - 20)
+    roiX2 = clamp(Math.round((boxRoi.x + boxRoi.w) * w), roiX1 + 20, w)
+    roiY1 = clamp(Math.round(boxRoi.y * h), 0, h - 20)
+    roiY2 = clamp(Math.round((boxRoi.y + boxRoi.h) * h), roiY1 + 20, h)
+  } else {
+    // 초록 박스 번들 자동 탐색
+    let bMinX = w, bMaxX = 0, bMinY = h, bMaxY = 0, greenCount = 0
+    for (let i = 0; i < n; i += 4) {
+      const pi = i
+      const r = data[pi], g = data[pi + 1], b = data[pi + 2]
+      const maxC = Math.max(r, g, b), minC = Math.min(r, g, b), diff = maxC - minC
+      if (diff > 0 && maxC > 40) {
+        let hue = 0
+        if (maxC === r) hue = ((g - b) / diff + (g < b ? 6 : 0)) * 60
+        else if (maxC === g) hue = ((b - r) / diff + 2) * 60
+        else hue = ((r - g) / diff + 4) * 60
+        const sat = diff / maxC
+        if (hue >= 70 && hue <= 170 && sat >= 0.20) {
+          const idx = i / 4
+          const x = idx % w, y = (idx / w) | 0
+          if (x < bMinX) bMinX = x
+          if (x > bMaxX) bMaxX = x
+          if (y < bMinY) bMinY = y
+          if (y > bMaxY) bMaxY = y
+          greenCount += 1
+        }
       }
     }
-  }
-
-  // 박스 전체 ROI 추출
-  const rowGreen = new Int32Array(h)
-  const colGreen = new Int32Array(w)
-  for (let y = 0; y < h; y += 1) {
-    const row = y * w
-    for (let x = 0; x < w; x += 1) {
-      if (isGreenBox[row + x]) {
-        rowGreen[y] += 1
-        colGreen[x] += 1
-      }
+    if (greenCount > n * 0.03 && bMaxY > bMinY + 60) {
+      const bundleH = bMaxY - bMinY + 1
+      roiX1 = Math.max(0, bMinX - 10)
+      roiX2 = Math.min(w, bMaxX + 10)
+      // 윗면 뚜껑 제외: 초록 덩어리 상단에서 25% 지점부터 앞면으로 간주
+      roiY1 = clamp(Math.round(bMinY + bundleH * 0.25), 0, h - 60)
+      roiY2 = Math.min(h - 5, bMaxY + 5)
     }
   }
 
-  let topY = -1, botY = -1
-  for (let y = 0; y < h; y += 1) {
-    if (rowGreen[y] > w * 0.10) {
-      if (topY === -1) topY = y
-      botY = y
-    }
-  }
-  const roiH = botY - topY + 1
-  if (topY === -1 || roiH < 50) return { boxes: [], previewData: null }
+  const roiW = roiX2 - roiX1
+  const roiH = roiY2 - roiY1
+  if (roiW < 40 || roiH < 30) return []
 
-  let leftX = -1, rightX = -1
-  for (let x = 0; x < w; x += 1) {
-    if (colGreen[x] > roiH * 0.18) {
-      if (leftX === -1) leftX = x
-      rightX = x
-    }
-  }
-  if (leftX === -1 || rightX - leftX < 80) return { boxes: [], previewData: null }
-
-  // 좌우 2열 분리 (중앙 세로 어두운 틈새 탐색)
-  const midX = Math.round((leftX + rightX) / 2)
-  let splitX = midX, minColLum = Infinity
-  for (let x = midX - 60; x <= midX + 60; x += 1) {
+  // ── 2. 좌우 열(2열) 분리: 가운데 ±15% 범위에서 가장 어두운 세로선 찾기 ──
+  const halfSearchW = Math.round(roiW * 0.15)
+  const midX = Math.round((roiX1 + roiX2) / 2)
+  let splitX = midX
+  let minColSum = Infinity
+  for (let x = midX - halfSearchW; x <= midX + halfSearchW; x += 1) {
+    if (x < roiX1 + 10 || x > roiX2 - 10) continue
     let s = 0
-    for (let y = topY + Math.round(roiH * 0.2); y <= botY - 10; y += 1) {
+    for (let y = roiY1; y <= roiY2; y += 2) {
       s += gray[y * w + x]
     }
-    if (s < minColLum) {
-      minColLum = s
+    if (s < minColSum) {
+      minColSum = s
       splitX = x
     }
   }
 
   const columns = [
-    { x1: leftX + 4, x2: splitX - 4 },
-    { x1: splitX + 4, x2: rightX - 4 },
+    { x1: roiX1 + 2, x2: splitX - 2 },
+    { x1: splitX + 2, x2: roiX2 - 2 },
   ]
 
-  // 2. 실제 층수 분할 (원본 흑백 Grayscale 명암 데이터에서 세로 방향 밝기 변화 계산)
-  //    박스 사이의 어두운 가로 그림자 선(골짜기) 위치를 찾음
+  // ── 3. 각 열에서 Sobel Y (세로 방향 미분)로 가로 경계선 위치 감지 ──────
+  // Sobel Y: 위아래 행의 밝기 차이가 큰 곳 = 박스 경계선
+  // 고정 8단 균등 분할 대신, 실제 에지 피크를 찾아 경계선을 결정합니다.
   const detectedBoxes = []
-  const debugLinesY = []
+  const targetLayers = 8 // 카트 표준 8단
 
   for (let c = 0; c < columns.length; c += 1) {
     const col = columns[c]
     const colW = col.x2 - col.x1
-    if (colW < 40) continue
+    if (colW < 20) continue
 
-    // 열 내부에서 각 행의 원본 흑백 평균 밝기 프로파일 계산
-    const rowLum = new Float32Array(h)
-    for (let y = topY; y <= botY; y += 1) {
+    // 행별 평균 밝기 계산
+    const rowLum = new Float32Array(roiH + 1)
+    for (let y = roiY1; y <= roiY2; y += 1) {
       let sum = 0
       const row = y * w
       for (let x = col.x1; x <= col.x2; x += 1) {
         sum += gray[row + x]
       }
-      rowLum[y] = sum / colW
+      rowLum[y - roiY1] = sum / colW
     }
 
-    // 5행 이동평균 스무딩 (노이즈 제거)
-    const smoothLum = new Float32Array(h)
-    for (let y = topY + 2; y <= botY - 2; y += 1) {
-      smoothLum[y] = (rowLum[y - 2] + rowLum[y - 1] + rowLum[y] + rowLum[y + 1] + rowLum[y + 2]) / 5
-    }
-
-    // 3. 상단의 매끈한 박스 윗면(가로 그림자 선 간격이 넓은 최상단 영역) 제외:
-    //    위에서 아래로 내려오며 첫 번째 뚜렷한 가로 그림자 골짜기(윗면 뚜껑과 1단 앞면 사이)를 탐색
-    let faceStartY = topY + Math.round(roiH * 0.12) // 기본 최소 뚜껑 높이
-    for (let y = topY + Math.round(roiH * 0.08); y <= topY + Math.round(roiH * 0.28); y += 1) {
-      // 골짜기(Local Minimum) 탐색
-      if (smoothLum[y] < smoothLum[y - 3] && smoothLum[y] < smoothLum[y + 3]) {
-        faceStartY = y
-        break
+    // 7행 이동평균 스무딩 (노이즈 제거)
+    const kSize = 7
+    const half = (kSize - 1) / 2
+    const smooth = new Float32Array(roiH + 1)
+    for (let i = 0; i <= roiH; i += 1) {
+      let s = 0, cnt = 0
+      for (let k = -half; k <= half; k += 1) {
+        const j = i + k
+        if (j >= 0 && j <= roiH) { s += rowLum[j]; cnt += 1 }
       }
+      smooth[i] = cnt > 0 ? s / cnt : rowLum[i]
     }
 
-    const faceH = botY - faceStartY + 1
-    // 카트 적재 표준 8단 높이 (약 faceH / 8)
-    const targetLayers = 8
-    const unitH = faceH / targetLayers
+    // Sobel Y 계산: 위 3행 평균 vs 아래 3행 평균 차이
+    const sobelY = new Float32Array(roiH + 1)
+    for (let i = 3; i <= roiH - 3; i += 1) {
+      const above = (smooth[i - 3] + smooth[i - 2] + smooth[i - 1]) / 3
+      const below = (smooth[i + 1] + smooth[i + 2] + smooth[i + 3]) / 3
+      sobelY[i] = Math.abs(below - above)
+    }
 
-    // 각 층의 경계선(어두운 가로 그림자 골짜기) 탐색
-    const layerEdges = [faceStartY]
+    // ── 경계선 위치 결정 전략 ───────────────────────────────────
+    // 각 예상 경계 위치 (roiH / targetLayers 간격) 주변 ±35% 범위에서
+    // Sobel Y 에지 강도가 가장 큰 곳을 경계선으로 선택합니다.
+    // 에지 강도 최소값(minEdge) 이상인 경우에만 에지로 인정하고, 아니면 균등 분할 위치를 사용합니다.
+    const unitH = roiH / targetLayers
+    const layerEdges = [0] // ROI 기준 상대 좌표
+
+    // Sobel Y 최대값 계산 (임계값 결정용)
+    let maxSobel = 0
+    for (let i = 0; i <= roiH; i += 1) {
+      if (sobelY[i] > maxSobel) maxSobel = sobelY[i]
+    }
+    // sensitivity 값 반영: 낮을수록 엄격(강한 경계선만), 높을수록 유연(약한 경계선도 허용)
+    const edgeThresh = maxSobel * Math.max(0.08, 0.35 - (sensitivity / 100) * 0.25)
 
     for (let l = 1; l < targetLayers; l += 1) {
-      const expectedY = Math.round(faceStartY + l * unitH)
-      const searchRange = Math.round(unitH * 0.35)
-      let bestY = expectedY
-      let minVal = Infinity
+      const expectedRel = Math.round(l * unitH)
+      const searchRange = Math.round(unitH * 0.38)
+      const searchStart = Math.max(1, expectedRel - searchRange)
+      const searchEnd = Math.min(roiH - 1, expectedRel + searchRange)
 
-      for (let y = expectedY - searchRange; y <= expectedY + searchRange; y += 1) {
-        if (y <= topY || y >= botY) continue
-        if (smoothLum[y] < minVal) {
-          minVal = smoothLum[y]
-          bestY = y
+      let bestRel = expectedRel
+      let maxEdge = -Infinity
+
+      // 에지 강도가 임계값 이상인 곳 중 최대 피크 선택
+      for (let i = searchStart; i <= searchEnd; i += 1) {
+        if (sobelY[i] >= edgeThresh && sobelY[i] > maxEdge) {
+          maxEdge = sobelY[i]
+          bestRel = i
         }
       }
-      layerEdges.push(bestY)
-      debugLinesY.push(bestY)
-    }
-    layerEdges.push(botY)
 
-    // 각 경계선과 경계선 사이마다 실제 박스 위치에 맞춰 사각형 생성
+      // 에지를 못 찾으면 균등 분할 위치 사용
+      layerEdges.push(bestRel)
+    }
+    layerEdges.push(roiH)
+
+    // 절대 좌표로 변환 후 사각형 생성
     for (let l = 0; l < targetLayers; l += 1) {
-      const y1 = layerEdges[l]
-      const y2 = layerEdges[l + 1]
+      const y1abs = roiY1 + layerEdges[l]
+      const y2abs = roiY1 + layerEdges[l + 1]
+      const boxH = y2abs - y1abs
+      if (boxH < 4) continue
       detectedBoxes.push({
         x: col.x1,
-        y: y1,
+        y: y1abs,
         w: colW,
-        h: y2 - y1,
+        h: boxH,
         confidence: 0.98,
         score: 1.8,
       })
     }
   }
 
-  // 전처리 보기 화면용 이미지 생성 (원본 흑백 명암 + 가로 경계선 및 열 영역 시각화)
-  const previewOut = new Uint8ClampedArray(n * 4)
+  return finalizeAndSortBoxes(detectedBoxes, w, h)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 디버그용: 캡 모드 전처리 흑백 이미지 (체이스가 눈으로 확인하는 [전처리 보기])
+// ─────────────────────────────────────────────────────────────────
+export function buildCapDebugPreview(imageData, rawParams = DEFAULT_DETECTION_PARAMS, templatePoint = null) {
+  const minR = Number(rawParams?.minRadius ?? 15)
+  const maxR = Number(rawParams?.maxRadius ?? 48)
+  const sensitivity = Number(rawParams?.sensitivity ?? 65)
+  const circles = detectDenseVialCapsByTemplateMatching(imageData, minR, maxR, sensitivity, templatePoint)
+
+  const { width: w, height: h, data } = imageData
+  const n = w * h
+  const out = new Uint8ClampedArray(n * 4)
+
   for (let i = 0; i < n; i += 1) {
-    const v = Math.round(gray[i])
-    previewOut[i * 4] = v
-    previewOut[i * 4 + 1] = v
-    previewOut[i * 4 + 2] = v
-    previewOut[i * 4 + 3] = 255
+    const p = i * 4
+    const v = Math.round(0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2])
+    out[p] = v
+    out[p + 1] = v
+    out[p + 2] = v
+    out[p + 3] = 255
   }
 
-  // 검출된 가로선 및 열 테두리를 파란/녹색 라인으로 선명하게 표시
-  for (let y = 0; y < h; y += 1) {
-    const row = y * w
-    const isLine = debugLinesY.some((ly) => Math.abs(y - ly) <= 1)
-    for (let x = 0; x < w; x += 1) {
-      const idx = row + x
-      if (isLine && ((x >= columns[0].x1 && x <= columns[0].x2) || (x >= columns[1].x1 && x <= columns[1].x2))) {
-        previewOut[idx * 4] = 0
-        previewOut[idx * 4 + 1] = 255 // 초록색 가로 경계선
-        previewOut[idx * 4 + 2] = 255
-        previewOut[idx * 4 + 3] = 255
+  for (let i = 0; i < circles.length; i += 1) {
+    const cx = Math.round(circles[i].x * w)
+    const cy = Math.round(circles[i].y * h)
+    const r = Math.max(3, Math.round(circles[i].r * w))
+    for (let dy = -r; dy <= r; dy += 1) {
+      for (let dx = -r; dx <= r; dx += 1) {
+        const d2 = dx * dx + dy * dy
+        if (Math.abs(d2 - r * r) <= r * 1.5 || d2 <= 4) {
+          const idx = (cy + dy) * w + (cx + dx)
+          if (idx >= 0 && idx < n) {
+            out[idx * 4] = 0
+            out[idx * 4 + 1] = 255
+            out[idx * 4 + 2] = 255
+            out[idx * 4 + 3] = 255
+          }
+        }
       }
     }
   }
 
-  return {
-    boxes: detectedBoxes,
-    previewData: { binaryData: previewOut, width: w, height: h },
-  }
+  return { binaryData: out, width: w, height: h }
 }
 
 // ─────────────────────────────────────────────────────────────────
 // 디버그용: 박스 모드 전처리 이미지 (체이스가 눈으로 확인하는 [전처리 보기])
 // ─────────────────────────────────────────────────────────────────
-export function buildBoxDebugPreview(imageData, rawBoxParams = DEFAULT_BOX_PARAMS) {
+export function buildBoxDebugPreview(imageData, rawBoxParams = DEFAULT_BOX_PARAMS, boxRoi = null) {
   const sensitivity = Number(rawBoxParams?.sensitivity ?? 55)
-  const result = processStackedCartBoxesPipeline(imageData, sensitivity)
-  return result.previewData
+  const boxes = detectStackedCartBoxesWithRoi(imageData, boxRoi, sensitivity)
+
+  const { width: w, height: h, data } = imageData
+  const n = w * h
+  const out = new Uint8ClampedArray(n * 4)
+
+  for (let i = 0; i < n; i += 1) {
+    const p = i * 4
+    const v = Math.round(0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2])
+    out[p] = v
+    out[p + 1] = v
+    out[p + 2] = v
+    out[p + 3] = 255
+  }
+
+  for (let i = 0; i < boxes.length; i += 1) {
+    const b = boxes[i]
+    const bx = Math.round(b.x * w)
+    const by = Math.round(b.y * h)
+    const bw = Math.round(b.w * w)
+
+    for (let x = bx; x < bx + bw; x += 1) {
+      for (let dy = -1; dy <= 1; dy += 1) {
+        const idx = (by + dy) * w + x
+        if (idx >= 0 && idx < n) {
+          out[idx * 4] = 0
+          out[idx * 4 + 1] = 255
+          out[idx * 4 + 2] = 255
+          out[idx * 4 + 3] = 255
+        }
+      }
+    }
+  }
+
+  return { binaryData: out, width: w, height: h }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// 카트 박스 모드 검출 함수
-// ─────────────────────────────────────────────────────────────────
-function detectStackedCartBoxes(imageData, sensitivity = 55) {
-  const result = processStackedCartBoxesPipeline(imageData, sensitivity)
-  return result.boxes
+function detectDenseVialCaps(imageData, minR, maxR, sensitivity, userTemplatePoint = null) {
+  return detectDenseVialCapsByTemplateMatching(imageData, minR, maxR, sensitivity, userTemplatePoint)
+}
+
+function detectDenseVialCores(imageData, minR, maxR, sensitivity, userTemplatePoint = null) {
+  return detectDenseVialCapsByTemplateMatching(imageData, minR, maxR, sensitivity, userTemplatePoint)
+}
+
+function detectStackedCartBoxes(imageData, sensitivity = 55, boxRoi = null) {
+  return detectStackedCartBoxesWithRoi(imageData, boxRoi, sensitivity)
 }
 
 // 원형 동심원 억제(NMS) 및 행·열 번호 정렬
@@ -904,17 +760,17 @@ function finalizeAndSortCircles(rawCircles, w, h, minR) {
   const clustered =
     accepted.length >= 6
       ? accepted.filter((c, idx) => {
-          let neighbors = 0
-          const maxDist = Math.max(40, c.r * 3.8)
-          for (let j = 0; j < accepted.length; j += 1) {
-            if (idx === j) continue
-            if (Math.hypot(c.x - accepted[j].x, c.y - accepted[j].y) <= maxDist) {
-              neighbors += 1
-              if (neighbors >= 2) return true
-            }
+        let neighbors = 0
+        const maxDist = Math.max(40, c.r * 3.8)
+        for (let j = 0; j < accepted.length; j += 1) {
+          if (idx === j) continue
+          if (Math.hypot(c.x - accepted[j].x, c.y - accepted[j].y) <= maxDist) {
+            neighbors += 1
+            if (neighbors >= 2) return true
           }
-          return false
-        })
+        }
+        return false
+      })
       : accepted
 
   if (clustered.length === 0) return []
@@ -1854,43 +1710,32 @@ function detectBoxesInCanvasFallback(imageData, rawBoxParams = DEFAULT_BOX_PARAM
 }
 
 /**
- * 캡 뚜껑 모드: OpenCV.js(준비 시) 또는 내장 Canvas 비전 엔진으로 둥근 바이알 개수를 검출합니다.
+ * 캡 뚜껑 모드: OpenCV 템플릿 매칭(cv.matchTemplate) 방식으로 바이알 캡을 정밀 검출합니다.
  */
-export function detectVialsInImageData(imageData, rawParams = DEFAULT_DETECTION_PARAMS) {
+export function detectVialsInImageData(imageData, rawParams = DEFAULT_DETECTION_PARAMS, userTemplatePoint = null) {
   if (!imageData || !imageData.width || !imageData.height || !imageData.data) return []
+  const sensitivity = clamp(Number(rawParams?.sensitivity ?? 65), 10, 95)
+  const rawMinR = Number(rawParams?.minRadius ?? 14)
+  const rawMaxR = Number(rawParams?.maxRadius ?? 85)
+  const minR = Math.max(4, Math.min(rawMinR, rawMaxR - 2))
+  const maxR = Math.max(minR + 2, rawMaxR)
 
-  if (isOpenCvReady()) {
-    try {
-      return detectVialsWithOpenCV(imageData, rawParams)
-    } catch {
-      return detectVialsInCanvasFallback(imageData, rawParams)
-    }
-  }
-
-  return detectVialsInCanvasFallback(imageData, rawParams)
+  return detectDenseVialCapsByTemplateMatching(imageData, minR, maxR, sensitivity, userTemplatePoint)
 }
 
 /**
- * 박스 모드: OpenCV.js findContours/사각형 필터링(준비 시) 또는 내장 4변 검증으로 박스 사각형을 검출합니다.
+ * 박스 모드: 지정된 앞면 영역(ROI) 내에서 좌우 2열 및 층간(8단) 가로 경계선을 정밀 검출합니다.
  */
-export function detectBoxesInImageData(imageData, rawBoxParams = DEFAULT_BOX_PARAMS) {
+export function detectBoxesInImageData(imageData, rawBoxParams = DEFAULT_BOX_PARAMS, boxRoi = null) {
   if (!imageData || !imageData.width || !imageData.height || !imageData.data) return []
-
-  if (isOpenCvReady()) {
-    try {
-      return detectBoxesWithOpenCV(imageData, rawBoxParams)
-    } catch {
-      return detectBoxesInCanvasFallback(imageData, rawBoxParams)
-    }
-  }
-
-  return detectBoxesInCanvasFallback(imageData, rawBoxParams)
+  const sensitivity = clamp(Number(rawBoxParams?.sensitivity ?? 55), 10, 95)
+  return detectStackedCartBoxesWithRoi(imageData, boxRoi, sensitivity)
 }
 
-// 캡 뚜껑 모드용 통합 분석 (가로 1200 리사이징 + 원형 검출)
-export async function analyzeVialImageFile(previewUrl, params = DEFAULT_DETECTION_PARAMS) {
+// 캡 뚜껑 모드용 통합 분석 (가로 1200 리사이징 + 템플릿 매칭 검출)
+export async function analyzeVialImageFile(previewUrl, params = DEFAULT_DETECTION_PARAMS, userTemplatePoint = null) {
   const prepared = await prepareAnalysisImageData(previewUrl)
-  const circles = detectVialsInImageData(prepared.imageData, params)
+  const circles = detectVialsInImageData(prepared.imageData, params, userTemplatePoint)
 
   return {
     ...prepared,
@@ -1898,10 +1743,10 @@ export async function analyzeVialImageFile(previewUrl, params = DEFAULT_DETECTIO
   }
 }
 
-// 박스 모드용 통합 분석 (가로 1200 리사이징 + 사각형 박스 검출)
-export async function analyzeBoxImageFile(previewUrl, boxParams = DEFAULT_BOX_PARAMS) {
+// 박스 모드용 통합 분석 (가로 1200 리사이징 + 앞면 ROI 기반 박스 검출)
+export async function analyzeBoxImageFile(previewUrl, boxParams = DEFAULT_BOX_PARAMS, boxRoi = null) {
   const prepared = await prepareAnalysisImageData(previewUrl)
-  const boxes = detectBoxesInImageData(prepared.imageData, boxParams)
+  const boxes = detectBoxesInImageData(prepared.imageData, boxParams, boxRoi)
 
   return {
     ...prepared,
@@ -2193,17 +2038,21 @@ export default function VialCountInspector({
   onResetParams,
   onToggleCircleAtPoint,
   onToggleBoxAtPoint,
+  onSelectTemplatePoint,
+  onSetBoxRoi,
   safeVialsPerBox = 50,
   applyScope = 'all',
   onChangeApplyScope,
 }) {
   const [showMarkers, setShowMarkers] = useState(true)
-  // 디버그 프리뷰 토글: 'original' | 'binary'
   const [previewMode, setPreviewMode] = useState('original')
   const overlayCanvasRef = useRef(null)
   const imgRef = useRef(null)
-  // 디버그 이미지 URL 캐시
-  const debugUrlRef = useRef(null)
+
+  // 박스 모드 앞면 ROI 드래그 상태
+  const [dragStart, setDragStart] = useState(null)
+  const [dragCurrent, setDragCurrent] = useState(null)
+  const isDraggingRef = useRef(false)
 
   const allEntries = [
     ...capPhotos.map((p, idx) => ({ mode: 'cap', photo: p, index: idx })),
@@ -2246,8 +2095,6 @@ export default function VialCountInspector({
       if (!ctx) return
       ctx.clearRect(0, 0, displayW, displayH)
 
-      if (!showMarkers) return
-
       const styles = getComputedStyle(document.documentElement)
       const capColor =
         styles.getPropertyValue('--color-success').trim() ||
@@ -2257,6 +2104,24 @@ export default function VialCountInspector({
       const badgeFillColor = styles.getPropertyValue('--color-primary').trim()
       const badgeTextColor = styles.getPropertyValue('--color-on-primary').trim()
       const fontFamily = styles.getPropertyValue('--font-num').trim() || 'sans-serif'
+
+      // 박스 모드: 사용자가 드래그 중인 사각형 실시간 표시
+      if (!isCapMode && dragStart && dragCurrent) {
+        const x1 = Math.min(dragStart.x, dragCurrent.x) * displayW
+        const y1 = Math.min(dragStart.y, dragCurrent.y) * displayH
+        const dw = Math.abs(dragCurrent.x - dragStart.x) * displayW
+        const dh = Math.abs(dragCurrent.y - dragStart.y) * displayH
+
+        ctx.fillStyle = 'rgba(48, 92, 222, 0.22)'
+        ctx.fillRect(x1, y1, dw, dh)
+        ctx.strokeStyle = '#305cde'
+        ctx.lineWidth = 2.5
+        ctx.setLineDash([6, 4])
+        ctx.strokeRect(x1, y1, dw, dh)
+        ctx.setLineDash([])
+      }
+
+      if (!showMarkers) return
 
       if (isCapMode && circles.length > 0) {
         for (let i = 0; i < circles.length; i += 1) {
@@ -2288,6 +2153,27 @@ export default function VialCountInspector({
           ctx.textAlign = 'center'
           ctx.textBaseline = 'middle'
           ctx.fillText(String(i + 1), cx, cy)
+        }
+
+        // 기준 캡 선택 위치 표시 (황금색 조준선)
+        if (activePhoto?.templatePoint) {
+          const tcx = activePhoto.templatePoint.x * displayW
+          const tcy = activePhoto.templatePoint.y * displayH
+          const tr = Math.max(8, (capParams.minRadius || 20) * (displayW / 1200))
+          ctx.beginPath()
+          ctx.arc(tcx, tcy, tr, 0, Math.PI * 2)
+          ctx.lineWidth = 3
+          ctx.strokeStyle = '#f59e0b'
+          ctx.stroke()
+          // 십자선
+          ctx.beginPath()
+          ctx.moveTo(tcx - tr - 6, tcy)
+          ctx.lineTo(tcx + tr + 6, tcy)
+          ctx.moveTo(tcx, tcy - tr - 6)
+          ctx.lineTo(tcx, tcy + tr + 6)
+          ctx.lineWidth = 2
+          ctx.strokeStyle = '#f59e0b'
+          ctx.stroke()
         }
       } else if (!isCapMode && boxes.length > 0) {
         for (let i = 0; i < boxes.length; i += 1) {
@@ -2333,17 +2219,17 @@ export default function VialCountInspector({
 
     window.addEventListener('resize', drawOverlay)
     return () => window.removeEventListener('resize', drawOverlay)
-  }, [activePhoto, isCapMode, circles, boxes, showMarkers, previewMode, capParams, boxParams])
+  }, [activePhoto, isCapMode, circles, boxes, showMarkers, previewMode, capParams, boxParams, dragStart, dragCurrent])
 
   if (!activePhoto) return null
 
-  // 디버그 프리뷰 URL 생성 (previewMode === 'binary' 일 때 canvas로 렌더링)
+  // 디버그 프리뷰 URL 생성
   let debugImgUrl = null
   if (previewMode === 'binary' && activePhoto?.imageData) {
     try {
       const result = isCapMode
-        ? buildCapDebugPreview(activePhoto.imageData, capParams)
-        : buildBoxDebugPreview(activePhoto.imageData, boxParams)
+        ? buildCapDebugPreview(activePhoto.imageData, capParams, activePhoto.templatePoint)
+        : buildBoxDebugPreview(activePhoto.imageData, boxParams, activePhoto.boxRoi)
       if (result) {
         const debugCanvas = document.createElement('canvas')
         debugCanvas.width = result.width
@@ -2355,7 +2241,7 @@ export default function VialCountInspector({
         }
       }
     } catch (e) {
-      // 디버그 생성 실패 시 원본 보기로 폴백
+      // 폴백
     }
   }
 
@@ -2363,19 +2249,61 @@ export default function VialCountInspector({
     ? debugImgUrl
     : activePhoto.previewUrl
 
-  function handleCanvasClick(event) {
+  function handleCanvasMouseDown(e) {
     const canvas = overlayCanvasRef.current
     if (!canvas) return
     const rect = canvas.getBoundingClientRect()
-    if (!rect.width || !rect.height) return
+    const nx = clamp((e.clientX - rect.left) / rect.width, 0, 1)
+    const ny = clamp((e.clientY - rect.top) / rect.height, 0, 1)
 
-    const nx = (event.clientX - rect.left) / rect.width
-    const ny = (event.clientY - rect.top) / rect.height
+    if (!isCapMode) {
+      isDraggingRef.current = true
+      setDragStart({ x: nx, y: ny })
+      setDragCurrent({ x: nx, y: ny })
+    }
+  }
 
-    if (isCapMode && onToggleCircleAtPoint) {
-      onToggleCircleAtPoint(activePhoto.id, nx, ny)
-    } else if (!isCapMode && onToggleBoxAtPoint) {
-      onToggleBoxAtPoint(activePhoto.id, nx, ny)
+  function handleCanvasMouseMove(e) {
+    if (isCapMode || !isDraggingRef.current || !dragStart) return
+    const canvas = overlayCanvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    const nx = clamp((e.clientX - rect.left) / rect.width, 0, 1)
+    const ny = clamp((e.clientY - rect.top) / rect.height, 0, 1)
+    setDragCurrent({ x: nx, y: ny })
+  }
+
+  function handleCanvasMouseUp(e) {
+    const canvas = overlayCanvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    const nx = clamp((e.clientX - rect.left) / rect.width, 0, 1)
+    const ny = clamp((e.clientY - rect.top) / rect.height, 0, 1)
+
+    if (isCapMode) {
+      // 캡 모드: 클릭한 캡을 기준 템플릿으로 지정하여 전체 템플릿 매칭 실행
+      if (onSelectTemplatePoint) {
+        onSelectTemplatePoint(activePhoto.id, { x: nx, y: ny })
+      }
+      return
+    }
+
+    if (!isDraggingRef.current || !dragStart) return
+    isDraggingRef.current = false
+    const minX = Math.min(dragStart.x, nx)
+    const maxX = Math.max(dragStart.x, nx)
+    const minY = Math.min(dragStart.y, ny)
+    const maxY = Math.max(dragStart.y, ny)
+    const bw = maxX - minX
+    const bh = maxY - minY
+
+    setDragStart(null)
+    setDragCurrent(null)
+
+    if (bw >= 0.05 && bh >= 0.05) {
+      if (onSetBoxRoi) {
+        onSetBoxRoi(activePhoto.id, { x: minX, y: minY, w: bw, h: bh })
+      }
     }
   }
 
@@ -2432,8 +2360,8 @@ export default function VialCountInspector({
               {isCapMode
                 ? `캡 #${activeIndex + 1} · ${circles.length}개 검출됨`
                 : `박스 #${activeIndex + 1} · 박스 ${boxes.length}개 × ${safeVialsPerBox} = ${(
-                    boxes.length * safeVialsPerBox
-                  ).toLocaleString()}개`}
+                  boxes.length * safeVialsPerBox
+                ).toLocaleString()}개`}
             </span>
           </div>
           <p className="jt-help" style={{ margin: 0 }}>
@@ -2547,17 +2475,79 @@ export default function VialCountInspector({
           alt={`검출 결과 확대: ${activePhoto.name}`}
           className="jt-product-img"
         />
+        {/* 캡 모드 안내: 아무 캡 정중앙을 클릭하면 그 캡을 기준 템플릿으로 삼아 전체 재매칭합니다. */}
+        {isCapMode && (
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 'var(--space-2)',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 'var(--z-dropdown)',
+              background: 'rgba(0,0,0,0.65)',
+              color: '#fff',
+              borderRadius: 'var(--r-sm)',
+              padding: 'var(--space-1) var(--space-3)',
+              fontSize: 'var(--fs-xs)',
+              pointerEvents: 'none',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <span style={{ color: '#fbbf24', marginRight: 4 }}>●</span>
+            아무 캡 정중앙을 클릭하면 해당 캡을 기준으로 전체 재계산합니다
+          </div>
+        )}
+        {/* 박스 모드 안내: 드래그로 앞면 영역 지정, 버튼으로 초기화 */}
+        {!isCapMode && (
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 'var(--space-2)',
+              left: 'var(--space-2)',
+              zIndex: 'var(--z-dropdown)',
+              display: 'flex',
+              gap: 'var(--space-2)',
+              alignItems: 'center',
+            }}
+          >
+            <span
+              style={{
+                background: 'rgba(0,0,0,0.65)',
+                color: '#fff',
+                borderRadius: 'var(--r-sm)',
+                padding: 'var(--space-1) var(--space-3)',
+                fontSize: 'var(--fs-xs)',
+                pointerEvents: 'none',
+              }}
+            >
+              마우스로 드래그해 박스 앞면 영역을 지정하세요
+            </span>
+            <button
+              type="button"
+              className="jt-btn-ghost jt-btn-sm"
+              style={{ fontSize: 'var(--fs-xs)', background: 'rgba(255,255,255,0.9)' }}
+              onClick={() => {
+                if (onSetBoxRoi) onSetBoxRoi(activePhoto.id, null)
+              }}
+            >
+              앞면 기본값 리셋
+            </button>
+          </div>
+        )}
         <canvas
           ref={overlayCanvasRef}
-          onClick={handleCanvasClick}
-          aria-label="검출 마커 오버레이 (클릭하여 마커 추가 또는 제외)"
+          onMouseDown={handleCanvasMouseDown}
+          onMouseMove={handleCanvasMouseMove}
+          onMouseUp={handleCanvasMouseUp}
+          onMouseLeave={handleCanvasMouseUp}
+          aria-label="검출 마커 오버레이 (캡 모드: 클릭으로 기준 캡 선택 / 박스 모드: 드래그로 앞면 영역 지정)"
           style={{
             position: 'absolute',
             inset: 0,
             width: '100%',
             height: '100%',
             zIndex: 'var(--z-raised)',
-            cursor: 'crosshair',
+            cursor: isCapMode ? 'crosshair' : 'crosshair',
           }}
         />
       </div>

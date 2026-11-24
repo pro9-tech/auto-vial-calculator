@@ -753,6 +753,44 @@ export default function CapturePage() {
     )
   }
 
+  // 캡 모드: 사용자가 사진 위 특정 캡을 클릭하면 그 캡을 기준 템플릿으로 삼아 전체 재매칭합니다.
+  function handleSelectTemplatePoint(photoId, pt) {
+    setHasSaved(false)
+    setCapPhotos((prev) =>
+      prev.map((photo) => {
+        if (photo.id !== photoId || !photo.imageData) return photo
+        // 클릭한 좌표를 templatePoint로 저장하고 즉시 재검출
+        const circles = detectVialsInImageData(photo.imageData, capParams, pt)
+        return {
+          ...photo,
+          templatePoint: pt,
+          circles,
+          count: circles.length,
+          engine: isOpenCvReady() ? 'opencv' : 'canvas',
+        }
+      })
+    )
+  }
+
+  // 박스 모드: 사용자가 드래그한 앞면 영역(ROI)으로 즉시 재검출합니다.
+  function handleSetBoxRoi(photoId, roi) {
+    setHasSaved(false)
+    setBoxPhotos((prev) =>
+      prev.map((photo) => {
+        if (photo.id !== photoId || !photo.imageData) return photo
+        // roi가 null이면 기본값(하단 60%) 적용
+        const boxes = detectBoxesInImageData(photo.imageData, boxParams, roi)
+        return {
+          ...photo,
+          boxRoi: roi,
+          boxes,
+          count: boxes.length,
+          engine: isOpenCvReady() ? 'opencv' : 'canvas',
+        }
+      })
+    )
+  }
+
   // 카트 박스 사진의 인식 박스 수를 스테퍼(−/+)로 보정합니다.
   function handleAdjustBoxCount(photoId, deltaOrValue, isAbsolute = false) {
     setHasSaved(false)
@@ -1320,6 +1358,8 @@ export default function CapturePage() {
               onResetParams={handleResetParams}
               onToggleCircleAtPoint={handleToggleCircleAtPoint}
               onToggleBoxAtPoint={handleToggleBoxAtPoint}
+              onSelectTemplatePoint={handleSelectTemplatePoint}
+              onSetBoxRoi={handleSetBoxRoi}
               safeVialsPerBox={safeVialsPerBox}
               applyScope={applyScope}
               onChangeApplyScope={setApplyScope}
