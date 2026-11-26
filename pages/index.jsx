@@ -269,6 +269,7 @@ export default function CapturePage() {
                     analysisHeight: result.analysisHeight,
                     circles: result.circles,
                     boxes: p.boxes || [],
+                    rawYoloDetections: result.rawYoloDetections || p.rawYoloDetections || [],
                     count: result.circles.length,
                     engine: result.engine,
                     analyzed: true,
@@ -314,6 +315,7 @@ export default function CapturePage() {
                     analysisHeight: result.analysisHeight,
                     boxes: result.boxes,
                     circles: p.circles || [],
+                    rawYoloDetections: result.rawYoloDetections || p.rawYoloDetections || [],
                     count: result.boxes.length,
                     engine: result.engine,
                     analyzed: true,
@@ -615,58 +617,99 @@ export default function CapturePage() {
     runSequentialAnalysis(capPhotos, boxPhotos, capParams, boxParams)
   }
 
-  // 캡 뚜껑 모드 슬라이더 실시간 디바운스 보정 (280ms 디바운스 + 비동기 분리로 렉 제거)
+  // 캡 뚜껑 모드 슬라이더 실시간 디바운스 보정 (민감도 0.15~0.70 대응 및 즉시 갱신)
   function handleChangeCapParams(nextParams) {
     setCapParams(nextParams)
     setHasSaved(false)
 
     if (sliderDebounceRef.current) clearTimeout(sliderDebounceRef.current)
     sliderDebounceRef.current = setTimeout(() => {
-      window.requestAnimationFrame(() => {
-        setCapPhotos((prev) => {
-          const targetId = activePhotoKey?.mode === 'cap' ? activePhotoKey.id : prev[0]?.id
-          return prev.map((photo) => {
-            if (!photo.imageData) return photo
-            if (applyScope === 'active' && photo.id !== targetId) return photo
+      window.requestAnimationFrame(async () => {
+        const targetId = activePhotoKey?.mode === 'cap' ? activePhotoKey.id : null
+        const confThresh = Math.max(0.15, Math.min(0.70, (nextParams.sensitivity || 35) / 100))
 
-            const circles = detectVialsInImageData(photo.imageData, nextParams)
-            return {
-              ...photo,
-              circles,
-              count: circles.length,
-              engine: isOpenCvReady() ? 'opencv' : 'canvas',
+        setCapPhotos((prev) => {
+          return prev.map((photo) => {
+            if (applyScope === 'active' && targetId && photo.id !== targetId) return photo
+            if (photo.rawYoloDetections && photo.rawYoloDetections.length > 0) {
+              // YOLO 원본 디텍션에서 새 confidence 기준으로 즉시 필터링
+              const filtered = photo.rawYoloDetections.filter(
+                (d) => d.classId === 1 && d.confidence >= confThresh
+              )
+              const circles = filtered.map((d, idx) => ({
+                id: `yolo-cap-${idx + 1}`,
+                x: (d.normX1 + d.normX2) / 2,
+                y: (d.normY1 + d.normY2) / 2,
+                r: Math.max(d.normW, d.normH) / 2,
+                confidence: d.confidence,
+                source: 'yolo',
+              }))
+              return {
+                ...photo,
+                circles,
+                count: circles.length,
+              }
+            } else if (photo.imageData) {
+              const circles = detectVialsInImageData(photo.imageData, nextParams)
+              return {
+                ...photo,
+                circles,
+                count: circles.length,
+              }
             }
+            return photo
           })
         })
       })
-    }, 280)
+    }, 200)
   }
 
-  // 박스 모드 슬라이더 실시간 디바운스 보정 (280ms 디바운스 + 비동기 분리로 렉 제거)
+  // 박스 모드 슬라이더 실시간 디바운스 보정
   function handleChangeBoxParams(nextParams) {
     setBoxParams(nextParams)
     setHasSaved(false)
 
     if (sliderDebounceRef.current) clearTimeout(sliderDebounceRef.current)
     sliderDebounceRef.current = setTimeout(() => {
-      window.requestAnimationFrame(() => {
-        setBoxPhotos((prev) => {
-          const targetId = activePhotoKey?.mode === 'box' ? activePhotoKey.id : prev[0]?.id
-          return prev.map((photo) => {
-            if (!photo.imageData) return photo
-            if (applyScope === 'active' && photo.id !== targetId) return photo
+      window.requestAnimationFrame(async () => {
+        const targetId = activePhotoKey?.mode === 'box' ? activePhotoKey.id : null
+        const confThresh = Math.max(0.15, Math.min(0.70, (nextParams.sensitivity || 35) / 100))
 
-            const boxes = detectBoxesInImageData(photo.imageData, nextParams)
-            return {
-              ...photo,
-              boxes,
-              count: boxes.length,
-              engine: isOpenCvReady() ? 'opencv' : 'canvas',
+        setBoxPhotos((prev) => {
+          return prev.map((photo) => {
+            if (applyScope === 'active' && targetId && photo.id !== targetId) return photo
+            if (photo.rawYoloDetections && photo.rawYoloDetections.length > 0) {
+              // YOLO 원본 디텍션에서 새 confidence 기준으로 즉시 필터링
+              const filtered = photo.rawYoloDetections.filter(
+                (d) => d.classId === 0 && d.confidence >= confThresh
+              )
+              const boxes = filtered.map((d, idx) => ({
+                id: `yolo-box-${idx + 1}`,
+                x: d.normX1,
+                y: d.normY1,
+                w: d.normW,
+                h: d.normH,
+                confidence: d.confidence,
+                source: 'yolo',
+              }))
+              return {
+                ...photo,
+                boxes,
+                count: boxes.length,
+              }
+            } else if (photo.imageData) {
+              const boxes = detectBoxesInImageData(photo.imageData, nextParams)
+              return {
+                ...photo,
+                boxes,
+                count: boxes.length,
+              }
             }
+            return photo
           })
         })
       })
-    }, 280)
+    }, 200)
   }
 
   function handleResetParams(mode) {

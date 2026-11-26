@@ -1,16 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import { runYoloInference } from '../utils/yoloOnnx'
 
-// 가로 1200 리사이징 기준 기본 검출 보정 파라미터입니다.
+// 가로 1200 리사이징 및 YOLO26 신뢰도 기준 기본 검출 보정 파라미터 (기본 민감도 35 = conf 0.35)
 export const DEFAULT_DETECTION_PARAMS = {
-  sensitivity: 55,
+  sensitivity: 35,
   minRadius: 15,
   maxRadius: 48,
 }
 
-// 박스 모드(사각형 윤곽선 검출)용 기본 보정 파라미터입니다.
+// 박스 모드용 기본 보정 파라미터입니다 (기본 민감도 35 = conf 0.35).
 export const DEFAULT_BOX_PARAMS = {
-  sensitivity: 55,
+  sensitivity: 35,
   minSize: 45,
   maxSize: 550,
 }
@@ -1880,20 +1880,22 @@ export function detectBoxesInImageData(imageData, rawBoxParams = DEFAULT_BOX_PAR
   return detectStackedCartBoxesWithRoi(imageData, boxRoi, sensitivity)
 }
 
-// 캡 뚜껑 모드용 통합 분석 (100% 로컬 온디바이스 YOLO26 best.onnx 추론 우선 실행)
+// 캡 뚜껑 모드용 통합 분석 (100% 로컬 온디바이스 YOLO26 best.onnx 추론 즉시 실행, score >= 0.35 기준)
 export async function analyzeVialImageFile(previewUrl, params = DEFAULT_DETECTION_PARAMS, userTemplatePoint = null) {
   const img = await loadImageElement(previewUrl)
+  const confThresh = Math.max(0.15, Math.min(0.70, (params?.sensitivity || 35) / 100))
 
   // 1. best.onnx 온디바이스 추론 시도
   try {
-    const yoloResult = await runYoloInference(img, 0.5)
-    // vial_cap 탐지 결과가 있으면 YOLO 결과 적용
+    const yoloResult = await runYoloInference(img, confThresh)
+    // vial_cap (class_id === 1) 탐지 결과가 있으면 YOLO 결과 적용
     if (yoloResult.circles && yoloResult.circles.length > 0) {
       const prepared = await prepareAnalysisImageData(previewUrl)
       return {
         ...prepared,
         circles: yoloResult.circles,
         boxes: yoloResult.boxes || [],
+        rawYoloDetections: yoloResult.rawDetections || [],
         engine: 'yolo-onnx',
       }
     }
@@ -1911,20 +1913,22 @@ export async function analyzeVialImageFile(previewUrl, params = DEFAULT_DETECTIO
   }
 }
 
-// 박스 모드용 통합 분석 (100% 로컬 온디바이스 YOLO26 best.onnx 추론 우선 실행)
+// 박스 모드용 통합 분석 (100% 로컬 온디바이스 YOLO26 best.onnx 추론 즉시 실행, score >= 0.35 기준)
 export async function analyzeBoxImageFile(previewUrl, boxParams = DEFAULT_BOX_PARAMS, boxRoi = null) {
   const img = await loadImageElement(previewUrl)
+  const confThresh = Math.max(0.15, Math.min(0.70, (boxParams?.sensitivity || 35) / 100))
 
   // 1. best.onnx 온디바이스 추론 시도
   try {
-    const yoloResult = await runYoloInference(img, 0.5)
-    // vial_box 탐지 결과가 있으면 YOLO 결과 적용
+    const yoloResult = await runYoloInference(img, confThresh)
+    // vial_box (class_id === 0) 탐지 결과가 있으면 YOLO 결과 적용
     if (yoloResult.boxes && yoloResult.boxes.length > 0) {
       const prepared = await prepareAnalysisImageData(previewUrl)
       return {
         ...prepared,
         boxes: yoloResult.boxes,
         circles: yoloResult.circles || [],
+        rawYoloDetections: yoloResult.rawDetections || [],
         engine: 'yolo-onnx',
       }
     }
@@ -2468,14 +2472,15 @@ export default function VialCountInspector({
     const nx = clamp((e.clientX - rect.left) / rect.width, 0, 1)
     const ny = clamp((e.clientY - rect.top) / rect.height, 0, 1)
 
+    // 마우스 클릭 시 수동 추가/제외 (수동 보정 기능 유지)
     if (isCapMode) {
-      // 캡 모드: 클릭한 캡을 기준 템플릿으로 지정하여 전체 템플릿 매칭 실행
-      if (onSelectTemplatePoint) {
-        onSelectTemplatePoint(activePhoto.id, { x: nx, y: ny })
+      if (onToggleCircleAtPoint && activePhoto?.id) {
+        onToggleCircleAtPoint(activePhoto.id, nx, ny)
       }
       return
     }
 
+    // 박스 모드: 드래그가 작았으면 클릭 수동 추가/제외, 드래그가 유의미하면 ROI 지정
     if (!isDraggingRef.current || !dragStart) return
     isDraggingRef.current = false
     const minX = Math.min(dragStart.x, nx)
@@ -2488,7 +2493,13 @@ export default function VialCountInspector({
     setDragStart(null)
     setDragCurrent(null)
 
-    if (bw >= 0.05 && bh >= 0.05) {
+    if (bw < 0.03 && bh < 0.03) {
+      // 단순 클릭: 수동 추가/제외
+      if (onToggleBoxAtPoint && activePhoto?.id) {
+        onToggleBoxAtPoint(activePhoto.id, nx, ny)
+      }
+    } else if (bw >= 0.05 && bh >= 0.05) {
+      // 드래그 ROI
       if (onSetBoxRoi) {
         onSetBoxRoi(activePhoto.id, { x: minX, y: minY, w: bw, h: bh })
       }
@@ -2663,7 +2674,7 @@ export default function VialCountInspector({
           alt={`검출 결과 확대: ${activePhoto.name}`}
           className="jt-product-img"
         />
-        {/* 캡 모드 안내: 아무 캡 정중앙을 클릭하면 그 캡을 기준 템플릿으로 삼아 전체 재매칭합니다. */}
+        {/* 캡 모드 안내 문구 */}
         {isCapMode && (
           <div
             style={{
@@ -2681,8 +2692,8 @@ export default function VialCountInspector({
               whiteSpace: 'nowrap',
             }}
           >
-            <span style={{ color: '#fbbf24', marginRight: 4 }}>●</span>
-            아무 캡 정중앙을 클릭하면 해당 캡을 기준으로 전체 재계산합니다
+            <span style={{ color: 'var(--color-success)', marginRight: 4 }}>●</span>
+            YOLO26 자동 탐지 완료 · 마커를 누르면 제외되고 빈 곳을 누르면 추가됩니다
           </div>
         )}
         {/* 박스 모드 안내: 드래그로 앞면 영역 지정, 버튼으로 초기화 */}
@@ -2791,31 +2802,31 @@ export default function VialCountInspector({
           </div>
         </div>
 
-        {/* 1. 민감도 (Threshold) 슬라이더 */}
+        {/* 1. 민감도 (Confidence Threshold) 슬라이더 (0.15 ~ 0.70 대응) */}
         <div>
           <div className="jt-row" style={{ justifyContent: 'space-between' }}>
             <label htmlFor="vial-threshold-slider" className="jt-label" style={{ margin: 0 }}>
-              민감도 (Threshold)
+              민감도 (Confidence / Threshold)
             </label>
             <span className="jt-num" style={{ fontWeight: 700 }}>
-              {currentParams.sensitivity}
+              {((currentParams.sensitivity || 35) / 100).toFixed(2)} ({currentParams.sensitivity})
             </span>
           </div>
           <input
             id="vial-threshold-slider"
             type="range"
             className="jt-slider"
-            min="10"
-            max="95"
+            min="15"
+            max="70"
             step="1"
-            value={currentParams.sensitivity}
+            value={currentParams.sensitivity || 35}
             aria-label="민감도 조절"
             onChange={(e) => handleSliderChange('sensitivity', Number(e.target.value))}
           />
           <p className="jt-help" style={{ margin: 0 }}>
             {isCapMode
-              ? '어두운 조명에서 바이알을 놓칠 때는 값을 높이고, 바닥 그림자까지 세면 값을 낮추세요.'
-              : '박스 경계가 연해서 놓칠 때는 값을 높이고, 내부 스티커나 선반까지 잡히면 값을 낮추세요.'}
+              ? 'YOLO26 탐지 신뢰도 기준값입니다 (기본 0.35). 값을 낮추면 더 많은 캡을 잡고, 높이면 확실한 캡만 남깁니다.'
+              : 'YOLO26 탐지 신뢰도 기준값입니다 (기본 0.35). 값을 낮추면 더 많은 박스를 잡고, 높이면 확실한 박스만 남깁니다.'}
           </p>
         </div>
 

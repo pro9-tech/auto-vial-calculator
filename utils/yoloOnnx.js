@@ -1,11 +1,11 @@
 // 100% 오프라인 온디바이스(로컬) ONNX Runtime Web 기반 YOLO26 객체 탐지 추론 모듈
-// 외부 API 키나 네트워크 통신 없이 브라우저 내에서 직접 best.onnx를 실행합니다.
+// 외부 API 키나 네트워크 통신 없이 브라우저 내에서 직접 /best.onnx를 실행합니다.
 
 let ortInstance = null
 let onnxSession = null
 let sessionLoadingPromise = null
 
-// 브라우저에 ort.min.js 스크립트 로드
+// ort.min.js 스크립트 로드
 export function loadOrtScript() {
   if (typeof window === 'undefined') return Promise.resolve(null)
   if (window.ort) return Promise.resolve(window.ort)
@@ -40,7 +40,7 @@ export function loadOrtScript() {
   })
 }
 
-// WASM 및 스크립트 로드
+// WASM 및 스크립트 초기화 (로컬 우선 및 CDN 폴백)
 export async function getOrt() {
   if (ortInstance) return ortInstance
   if (typeof window === 'undefined') return null
@@ -49,10 +49,16 @@ export async function getOrt() {
   if (!ort) throw new Error('ONNX Runtime Web 엔진을 브라우저에서 초기화할 수 없습니다.')
   ortInstance = ort
 
-  // 로컬 WASM 정적 자산 경로 설정 (오프라인 온디바이스 보장)
+  // WASM 경로 설정: public 로컬 경로 우선, 누락 시 CDN 폴백 지원
   if (ortInstance && ortInstance.env && ortInstance.env.wasm) {
+    ortInstance.env.wasm.wasmPaths = {
+      'ort-wasm-simd-threaded.wasm': '/ort-wasm/ort-wasm-simd-threaded.wasm',
+      'ort-wasm-simd-threaded.jsep.wasm': '/ort-wasm/ort-wasm-simd-threaded.jsep.wasm',
+      'ort-wasm.wasm': '/ort-wasm/ort-wasm.wasm',
+    }
+    // 기본 디렉터리 경로 설정
     ortInstance.env.wasm.wasmPaths = '/ort-wasm/'
-    ortInstance.env.wasm.numThreads = 1 // 모바일 환경 안정성 확보
+    ortInstance.env.wasm.numThreads = 1 // 모바일 환경 호환성
   }
 
   return ortInstance
@@ -87,8 +93,9 @@ export async function getOnnxSession() {
 }
 
 /**
- * HTMLImageElement 또는 ImageBitmap 등으로부터 640x640 레터박스 전처리 수행
- * NCHW Float32Array (0~1 정규화) 텐서 생성
+ * 640x640 레터박스(Letterbox) 전처리:
+ * 가로세로 비율이 깨지지 않도록 회색 여백(#727272)을 넣어 리사이즈하고,
+ * 0~1 정규화 후 NCHW [1, 3, 640, 640] float32 텐서 생성
  */
 export function preprocessImageTo640(img) {
   const origW = img.naturalWidth || img.videoWidth || img.width
@@ -115,7 +122,7 @@ export function preprocessImageTo640(img) {
   const imgData = ctx.getImageData(0, 0, targetSize, targetSize)
   const { data } = imgData
 
-  // 1x3x640x640 NCHW 생성
+  // 1x3x640x640 NCHW Float32Array
   const floatData = new Float32Array(3 * targetSize * targetSize)
   const planeSize = targetSize * targetSize
 
@@ -152,8 +159,8 @@ function runNms(boxes, iouThreshold = 0.45) {
       const x2 = Math.min(b1.x2, b2.x2)
       const y2 = Math.min(b1.y2, b2.y2)
       const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
-      const area1 = (b1.x2 - b1.x1) * (b1.y2 - b1.y1)
-      const area2 = (b2.x2 - b2.x1) * (b2.y2 - b2.y1)
+      const area1 = Math.max(0, b1.x2 - b1.x1) * Math.max(0, b1.y2 - b1.y1)
+      const area2 = Math.max(0, b2.x2 - b2.x1) * Math.max(0, b2.y2 - b2.y1)
       const iou = inter / Math.max(1e-6, area1 + area2 - inter)
       if (iou > iouThreshold) {
         keep = false
@@ -168,10 +175,10 @@ function runNms(boxes, iouThreshold = 0.45) {
 /**
  * 100% 로컬 온디바이스 YOLO26 추론 실행
  * @param {HTMLImageElement|ImageBitmap} imageElement 
- * @param {number} confThreshold confidence 기준값 (기본 0.5)
+ * @param {number} confThreshold confidence 기준값 (기본 0.35)
  * @returns {Promise<{ boxes: Array, capCount: number, boxCount: number, circles: Array, rectBoxes: Array }>}
  */
-export async function runYoloInference(imageElement, confThreshold = 0.5) {
+export async function runYoloInference(imageElement, confThreshold = 0.35) {
   const ort = await getOrt()
   const session = await getOnnxSession()
 
@@ -188,9 +195,9 @@ export async function runYoloInference(imageElement, confThreshold = 0.5) {
   const data = output.data
   const candidates = []
 
-  // 출력 형식 판별
-  // 형태 A: [1, 300, 6] (NMS-free 행별 [x1, y1, x2, y2, conf, class_id])
-  // 형태 B: [1, 6, 8400] (표준 YOLO [cx, cy, w, h, score0, score1])
+  // 출력 형식 판별 및 파싱:
+  // 1) (1, 300, 6) 형태: NMS-free 헤드 ([x1, y1, x2, y2, score, class_id])
+  // 2) (1, 6, 8400) 형태: 표준 YOLO ([cx, cy, w, h, score_box, score_cap])
   if (dims.length === 3 && dims[1] === 300 && dims[2] === 6) {
     const numRows = 300
     for (let i = 0; i < numRows; i++) {
@@ -199,15 +206,14 @@ export async function runYoloInference(imageElement, confThreshold = 0.5) {
       const y1 = data[offset + 1]
       const x2 = data[offset + 2]
       const y2 = data[offset + 3]
-      const conf = data[offset + 4]
+      const score = data[offset + 4]
       const classId = Math.round(data[offset + 5])
 
-      if (conf >= confThreshold) {
-        candidates.push({ x1, y1, x2, y2, confidence: conf, classId })
+      if (score >= confThreshold) {
+        candidates.push({ x1, y1, x2, y2, confidence: score, classId })
       }
     }
   } else if (dims.length === 3 && dims[1] === 6 && dims[2] > 0) {
-    const numChannels = dims[1]
     const numAnchors = dims[2]
     for (let i = 0; i < numAnchors; i++) {
       const cx = data[0 * numAnchors + i]
@@ -230,10 +236,10 @@ export async function runYoloInference(imageElement, confThreshold = 0.5) {
     }
   }
 
-  // 중복 억제 (필요시)
+  // 중복 제거
   const filtered = candidates.length > 0 ? runNms(candidates, 0.45) : []
 
-  // 원본 이미지 크기(0~1 정규화)로 좌표 복원
+  // 원본 사진 좌표계(0~1 정규화)로 역변환
   const circles = []
   const rectBoxes = []
   let boxCount = 0
@@ -241,7 +247,7 @@ export async function runYoloInference(imageElement, confThreshold = 0.5) {
 
   for (let i = 0; i < filtered.length; i++) {
     const det = filtered[i]
-    // 640 패딩 및 스케일 역변환
+    // 패딩과 스케일을 역계산하여 원본 이미지 픽셀 좌표 획득
     const rx1 = Math.max(0, Math.min(origW, (det.x1 - padX) / scale))
     const ry1 = Math.max(0, Math.min(origH, (det.y1 - padY) / scale))
     const rx2 = Math.max(0, Math.min(origW, (det.x2 - padX) / scale))
@@ -264,8 +270,8 @@ export async function runYoloInference(imageElement, confThreshold = 0.5) {
         confidence: Number(det.confidence.toFixed(2)),
         source: 'yolo',
       })
-    } else {
-      // vial_cap
+    } else if (det.classId === 1) {
+      // vial_cap: 정확한 캡 중앙 위치(cx, cy) 및 반지름 계산
       capCount++
       const normCx = (rx1 + rx2) / (2 * origW)
       const normCy = (ry1 + ry2) / (2 * origH)
