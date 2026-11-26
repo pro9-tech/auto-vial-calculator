@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { runYoloInference } from '../utils/yoloOnnx'
 
 // 가로 1200 리사이징 기준 기본 검출 보정 파라미터입니다.
 export const DEFAULT_DETECTION_PARAMS = {
@@ -1879,8 +1880,28 @@ export function detectBoxesInImageData(imageData, rawBoxParams = DEFAULT_BOX_PAR
   return detectStackedCartBoxesWithRoi(imageData, boxRoi, sensitivity)
 }
 
-// 캡 뚜껑 모드용 통합 분석 (가로 1200 리사이징 + 템플릿 매칭 검출)
+// 캡 뚜껑 모드용 통합 분석 (100% 로컬 온디바이스 YOLO26 best.onnx 추론 우선 실행)
 export async function analyzeVialImageFile(previewUrl, params = DEFAULT_DETECTION_PARAMS, userTemplatePoint = null) {
+  const img = await loadImageElement(previewUrl)
+
+  // 1. best.onnx 온디바이스 추론 시도
+  try {
+    const yoloResult = await runYoloInference(img, 0.5)
+    // vial_cap 탐지 결과가 있으면 YOLO 결과 적용
+    if (yoloResult.circles && yoloResult.circles.length > 0) {
+      const prepared = await prepareAnalysisImageData(previewUrl)
+      return {
+        ...prepared,
+        circles: yoloResult.circles,
+        boxes: yoloResult.boxes || [],
+        engine: 'yolo-onnx',
+      }
+    }
+  } catch (err) {
+    console.warn('YOLO ONNX 추론 건너뜀 (클래식 템플릿 매칭 폴백):', err)
+  }
+
+  // 2. 클래식 컴퓨터 비전(템플릿 매칭) 폴백
   const prepared = await prepareAnalysisImageData(previewUrl)
   const circles = detectVialsInImageData(prepared.imageData, params, userTemplatePoint)
 
@@ -1890,8 +1911,28 @@ export async function analyzeVialImageFile(previewUrl, params = DEFAULT_DETECTIO
   }
 }
 
-// 박스 모드용 통합 분석 (가로 1200 리사이징 + 앞면 ROI 기반 박스 검출)
+// 박스 모드용 통합 분석 (100% 로컬 온디바이스 YOLO26 best.onnx 추론 우선 실행)
 export async function analyzeBoxImageFile(previewUrl, boxParams = DEFAULT_BOX_PARAMS, boxRoi = null) {
+  const img = await loadImageElement(previewUrl)
+
+  // 1. best.onnx 온디바이스 추론 시도
+  try {
+    const yoloResult = await runYoloInference(img, 0.5)
+    // vial_box 탐지 결과가 있으면 YOLO 결과 적용
+    if (yoloResult.boxes && yoloResult.boxes.length > 0) {
+      const prepared = await prepareAnalysisImageData(previewUrl)
+      return {
+        ...prepared,
+        boxes: yoloResult.boxes,
+        circles: yoloResult.circles || [],
+        engine: 'yolo-onnx',
+      }
+    }
+  } catch (err) {
+    console.warn('YOLO ONNX 추론 건너뜀 (앞면 ROI 경계선 검출 폴백):', err)
+  }
+
+  // 2. 클래식 컴퓨터 비전 폴백
   const prepared = await prepareAnalysisImageData(previewUrl)
   const boxes = detectBoxesInImageData(prepared.imageData, boxParams, boxRoi)
 

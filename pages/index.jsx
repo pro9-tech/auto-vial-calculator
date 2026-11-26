@@ -59,9 +59,10 @@ export default function CapturePage() {
   // 확대 보정 뷰어에 선택된 사진 ({ mode: 'cap' | 'box', id: string })
   const [activePhotoKey, setActivePhotoKey] = useState(null)
 
-  // 5. 드래그 앤 드롭, OpenCV 엔진 상태 및 순차 분석 진행 상태
+  // 5. 드래그 앤 드롭, YOLO/OpenCV 엔진 상태 및 순차 분석 진행 상태
   const [dragOverMode, setDragOverMode] = useState(null)
   const [cvEngineReady, setCvEngineReady] = useState(false)
+  const [yoloEngineReady, setYoloEngineReady] = useState(false)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [analysisProgress, setAnalysisProgress] = useState({
     active: false,
@@ -115,6 +116,15 @@ export default function CapturePage() {
         setCvEngineReady(Boolean(res?.ready))
       }
     })
+    // 온디바이스 YOLO26 best.onnx 세션 백그라운드 예열
+    import('../utils/yoloOnnx')
+      .then((mod) => mod.getOnnxSession())
+      .then(() => {
+        if (active) setYoloEngineReady(true)
+      })
+      .catch((e) => {
+        console.warn('YOLO ONNX 백그라운드 로드 안내:', e?.message || e)
+      })
     return () => {
       active = false
     }
@@ -959,7 +969,11 @@ export default function CapturePage() {
 
           <div className="jt-row" style={{ gap: 'var(--space-2)' }}>
             <span className="jt-tag">
-              {cvEngineReady ? 'OpenCV.js 활성' : '내장 비전 엔진'}
+              {yoloEngineReady
+                ? 'YOLO26 온디바이스 활성'
+                : cvEngineReady
+                ? 'OpenCV.js 활성'
+                : '내장 비전 엔진'}
             </span>
             {hasAnyPhotos && (
               <>
@@ -1401,7 +1415,11 @@ export default function CapturePage() {
                         </td>
                         <td>{item.name}</td>
                         <td className="jt-num">{item.analyzing ? '분석 중' : `${item.count} 개`}</td>
-                        <td>원형/윤곽선 검출 + 수동 보정</td>
+                        <td>
+                          {item.engine === 'yolo-onnx'
+                            ? 'YOLO26 온디바이스 탐지'
+                            : '원형 템플릿 매칭 + 수동 보정'}
+                        </td>
                         <td className="jt-num" style={{ fontWeight: 700 }}>
                           {item.analyzing ? '—' : `${item.count.toLocaleString()} 개`}
                         </td>
@@ -1447,8 +1465,10 @@ export default function CapturePage() {
                               </button>
                             </div>
                           </td>
-                          <td className="jt-num">
-                            {`박스 ${item.count}개 × ${safeVialsPerBox} = ${converted.toLocaleString()}개`}
+                          <td>
+                            {item.engine === 'yolo-onnx'
+                              ? 'YOLO26 온디바이스 탐지'
+                              : '앞면 ROI 수평 경계선 검출'}
                           </td>
                           <td className="jt-num" style={{ fontWeight: 700 }}>
                             {item.analyzing ? '—' : `${converted.toLocaleString()} 개`}
